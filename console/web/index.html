@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WIS Console — High-Performance Cognitive Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+  <!-- Clean Background Grid -->
+  <div class="bg-grid" aria-hidden="true"></div>
+
+  <!-- Approval Overlay (hidden by default) -->
+  <div class="approval-overlay" id="approval-overlay" hidden>
+    <div class="approval-card">
+      <h3 class="approval-title">User Governance Authorization Required</h3>
+      <p class="approval-desc" id="approval-desc">A restricted system action requires explicit operator approval to
+        execute.</p>
+      <div class="approval-detail" id="approval-detail"></div>
+      <div class="approval-actions">
+        <button class="approval-btn approval-btn--deny" id="btn-deny">Deny</button>
+        <button class="approval-btn approval-btn--proceed" id="btn-proceed">Proceed</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- App Container -->
+  <div class="app" id="app">
+
+    <!-- ====== HEADER ====== -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="orb" id="orb" data-state="idle" aria-hidden="true">
+          <div class="orb-core"></div>
+          <div class="orb-ring orb-ring--1"></div>
+          <div class="orb-ring orb-ring--2"></div>
+        </div>
+        <div class="brand">
+          <div class="brand-header">
+            <h1 class="brand-title">WIS</h1>
+          </div>
+        </div>
+      </div>
+
+      <div class="topbar-center">
+        <div class="quick-status">
+          <span class="status-chip"><span class="chip-dot"></span> 3-Path Engine</span>
+          <button class="mode-chip" id="mode-chip" title="Toggle security mode">
+            <span class="mode-icon" id="mode-icon">🔒</span>
+            <span class="mode-label" id="mode-label">SECURE</span>
+          </button>
+          <span class="step-badge" id="step-badge" hidden>Step <span id="step-num">0</span>/<span
+              id="step-max">10</span></span>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <span class="conn" id="conn" title="Connection status">
+          <span class="conn-dot"></span>
+          <span class="conn-text">connecting</span>
+        </span>
+        <button class="icon-btn" id="btn-toggle-console-top" title="Toggle Bottom Console"
+          aria-label="Toggle Console">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+            <line x1="3" y1="15" x2="21" y2="15"></line>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- ====== CENTER: CHAT FEED ====== -->
+    <main class="chat-main" id="chat-main">
+      <div class="chat-container" id="messages">
+        <div class="empty" id="empty">
+          <h2 class="empty-title">WIS Cognitive Agent</h2>
+          <div class="quick-actions-bar">
+            <button class="quick-btn" data-cmd="System status">System Status</button>
+            <button class="quick-btn" data-cmd="System time">System Time</button>
+            <button class="quick-btn" data-cmd="Memory state">Memory State</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Typing Indicator -->
+      <div class="typing" id="typing" hidden>
+        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      </div>
+
+      <!-- Composer Bar -->
+      <footer class="composer">
+        <div class="composer-inner">
+          <textarea id="input" class="composer-input" placeholder="Type a message to WIS..." rows="1"
+            autofocus></textarea>
+
+          <div class="composer-actions">
+            <button id="mic-btn" class="action-btn mic-btn" title="Voice (Microphone)" aria-label="Microphone">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                <line x1="12" y1="19" x2="12" y2="23"></line>
+                <line x1="8" y1="23" x2="16" y2="23"></line>
+              </svg>
+            </button>
+            <button id="send" class="action-btn send-btn" title="Send (Enter)" aria-label="Send">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="composer-footer-hint">Enter to send &middot; Shift+Enter for new line</div>
+      </footer>
+    </main>
+
+    <!-- ====== BOTTOM CONSOLE (RESIZABLE) ====== -->
+    <aside class="bottom-console" id="bottom-console" data-state="expanded" style="height: 240px;">
+      <!-- Drag Resizer Handle -->
+      <div class="console-resizer" id="console-resizer" title="Drag to resize console">
+        <div class="resizer-bar"></div>
+      </div>
+
+      <!-- Console Header Bar with Tabs & Controls -->
+      <div class="console-header">
+        <div class="console-tabs">
+          <button class="console-tab active" data-tab="tab-trace">Execution Trace</button>
+          <button class="console-tab" data-tab="tab-logs">System Logs</button>
+          <button class="console-tab" data-tab="tab-memory">Mnemonic State</button>
+          <button class="console-tab" data-tab="tab-abilities">Ability Registry</button>
+          <button class="console-tab" data-tab="tab-proactivity">Scheduler & Routines</button>
+        </div>
+
+        <div class="console-controls">
+          <button class="console-icon-btn" id="btn-clear-trace" title="Clear Trace">Clear</button>
+          <button class="console-icon-btn" id="btn-toggle-console" title="Toggle Console">
+            <svg class="chevron-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+              stroke-width="2">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Console Body: Tab Contents -->
+      <div class="console-body">
+        <!-- Tab 1: Execution Trace -->
+        <div class="tab-content active" id="tab-trace">
+          <div class="cognitive-trace-feed" id="cognitive-trace">
+            <span class="trace-empty">Awaiting execution data...</span>
+          </div>
+        </div>
+
+        <!-- Tab 2: System Logs -->
+        <div class="tab-content" id="tab-logs">
+          <pre class="logs-pre" id="logs-pre">Loading system records...</pre>
+        </div>
+
+        <!-- Tab 3: Mnemonic State -->
+        <div class="tab-content" id="tab-memory">
+          <div class="memory-grid">
+            <div class="memory-card">
+              <h4>Mnemonic Metrics</h4>
+              <div class="stats-row">
+                <div class="stat-box"><span>Facts</span><b id="stat-facts">0</b></div>
+                <div class="stat-box"><span>Vault (Skills)</span><b id="stat-vault">0</b></div>
+                <div class="stat-box"><span>Abilities</span><b id="stat-abilities">0</b></div>
+              </div>
+            </div>
+            <div class="memory-card">
+              <h4>Stored Fact Index</h4>
+              <ul class="facts-list" id="facts-list">
+                <li class="muted">No records found.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 4: Ability Registry -->
+        <div class="tab-content" id="tab-abilities">
+          <div class="settings-grid">
+            <div class="settings-card">
+              <h4>Active Ability Registry</h4>
+              <ul class="abilities-list" id="abilities-list">
+                <li class="muted">Loading capabilities...</li>
+              </ul>
+            </div>
+            <div class="settings-card">
+              <h4>Console Options</h4>
+              <div class="switch-group">
+                <label class="switch-item">
+                  <input type="checkbox" id="opt-autoscroll" checked />
+                  <span>Auto-scroll messages</span>
+                </label>
+                <label class="switch-item">
+                  <input type="checkbox" id="opt-tts" checked />
+                  <span>Voice synthesis (TTS)</span>
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 5: Scheduler & Routines -->
+        <div class="tab-content" id="tab-proactivity">
+          <div class="proactivity-grid">
+            <div class="proactivity-card">
+              <h4>Proactive Inbox</h4>
+              <ul class="proactivity-list" id="proactivity-inbox">
+                <li class="muted">No suggestions pending.</li>
+              </ul>
+            </div>
+            <div class="proactivity-card">
+              <h4>Scheduled Routines</h4>
+              <ul class="proactivity-list" id="proactivity-routines">
+                <li class="muted">No routines configured.</li>
+              </ul>
+            </div>
+            <div class="proactivity-card">
+              <h4>Reactive Rules</h4>
+              <ul class="proactivity-list" id="proactivity-rules">
+                <li class="muted">No rules configured.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+
+</html>

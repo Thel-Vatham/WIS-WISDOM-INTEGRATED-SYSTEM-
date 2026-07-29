@@ -1,0 +1,1 @@
+"""WIS Console - Web interface."""
