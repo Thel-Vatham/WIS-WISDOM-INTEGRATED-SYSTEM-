@@ -194,6 +194,11 @@ def build_core(settings: dict) -> dict:
     mnemonic = Memory(db_path=db_path)
     logger.info(f"Memory ready (history: {len(mnemonic.get_history())} turns)")
 
+    # --- Hardware & Procedural Memory ---
+    from core.hardware_memory import HardwareMemory
+    hw_vault = HardwareMemory(db_path=db_path)
+    logger.info(f"HardwareMemory ready ({len(hw_vault.list_devices())} registered devices)")
+
     # --- Skill Memory ---
     vault = SkillMemory(db_path=db_path)
     logger.info(f"SkillMemory ready (healthy: {vault.stats().get('healthy', 0)} skills)")
@@ -230,8 +235,12 @@ def build_core(settings: dict) -> dict:
 
     # --- Abilities ---
     registry = AbilityRegistry()
-    _register_default_abilities(registry, settings)
+    _register_default_abilities(registry, settings, hw_vault)
     logger.info(f"Abilities: {list(registry.all().keys())}")
+
+    # --- Engineering Fast-Path ---
+    from core.fastpath import EngineeringFastPath
+    fast_router = EngineeringFastPath(hardware_memory=hw_vault, abilities=registry)
 
     # --- Action Pipeline (multi-step) ---
     max_steps = agentic_cfg.get("max_steps", 10)
@@ -241,8 +250,10 @@ def build_core(settings: dict) -> dict:
         abilities=registry,
         safety=aegis,
         max_steps=max_steps,
+        fastpath=fast_router,
+        hardware_memory=hw_vault,
     )
-    logger.info(f"ActionPipeline ready (3 paths, max_steps={max_steps})")
+    logger.info(f"ActionPipeline ready (Fast-Path + 3 cognitive paths, max_steps={max_steps})")
 
     # --- Proactivity Engine ---
     proactivity = None
@@ -283,10 +294,12 @@ def build_core(settings: dict) -> dict:
         "proactivity": proactivity,
         "goal_manager": goal_manager,
         "task_store": task_store,
+        "hardware_memory": hw_vault,
+        "fastpath": fast_router,
     }
 
 
-def _register_default_abilities(registry: AbilityRegistry, settings: dict) -> None:
+def _register_default_abilities(registry: AbilityRegistry, settings: dict, hw_vault: Optional[Any] = None) -> None:
     """Registra las habilidades base de WIS."""
     # Voice (TTS)
     try:
@@ -393,6 +406,13 @@ def _register_default_abilities(registry: AbilityRegistry, settings: dict) -> No
         registry.register(MQTTCommAbility())
     except Exception as e:
         logger.warning(f"MQTTCommAbility not loaded: {e}")
+
+    # Microcontroller & Embedded Toolchains (PlatformIO, Arduino-CLI, esptool)
+    try:
+        from abilities.toolchain import ToolchainAbility
+        registry.register(ToolchainAbility(hardware_memory=hw_vault))
+    except Exception as e:
+        logger.warning(f"ToolchainAbility not loaded: {e}")
 
     # Custom abilities generated dynamically (robots, IoT, etc.)
     try:

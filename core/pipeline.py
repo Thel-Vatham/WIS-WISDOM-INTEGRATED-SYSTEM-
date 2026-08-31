@@ -47,9 +47,13 @@ class ActionPipeline:
         abilities: Optional[Union[Dict[str, AbilityFn], Any]] = None,
         safety: Optional[SafetyPolicy] = None,
         max_steps: int = DEFAULT_MAX_STEPS,
+        fastpath: Optional[Any] = None,
+        hardware_memory: Optional[Any] = None,
     ) -> None:
         self.reasoning: ReasoningEngine = reasoning
         self.skill_memory: SkillMemory = skill_memory
+        self.fastpath = fastpath
+        self.hardware_memory = hardware_memory
         if isinstance(abilities, dict):
             self.abilities: Any = dict(abilities)
         elif abilities is not None:
@@ -141,6 +145,13 @@ class ActionPipeline:
         event_bus.emit("pipeline.input_received", {"text": text})
         self._cancel_event = asyncio.Event()
 
+        # --- Path 0: Engineering Fast-Path (0ms Deterministic Hardware / Devices / Commands) ---
+        if self.fastpath is not None:
+            fast_res = await self.fastpath.try_handle(text)
+            if fast_res is not None and fast_res.get("handled"):
+                event_bus.emit("pipeline.fastpath_hit", {"text": text[:80]})
+                return self._finalize(fast_res, "fastpath", success=True)
+
         # --- Path 1: Reflexive ---
         result = await self._try_reflexive(text)
         if result is not None:
@@ -151,8 +162,6 @@ class ActionPipeline:
                 results, ok = await self._execute_calls(calls)
                 result["results"] = results
                 result["success"] = ok
-                # Reemplaza el placeholder ("Checking current time...") con la
-                # respuesta real compuesta a partir del resultado de la tool call.
                 result["response"] = self._compose_result_response(
                     result.get("response", ""), calls, results
                 )

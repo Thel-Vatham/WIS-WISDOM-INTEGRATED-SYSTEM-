@@ -79,7 +79,7 @@ class AbilityRegistry:
             return []
 
         # Crear un nombre de modulo unico basado en la ruta para evitar colisiones
-        module_name = f"wis.abilities.custom.{path.stem}"
+        module_name = f"_wis_custom_{path.stem}_{abs(hash(str(path)))}"
 
         try:
             # Si el modulo ya fue cargado antes, lo recargamos para reflejar cambios
@@ -87,6 +87,9 @@ class AbilityRegistry:
                 mod = importlib.reload(sys.modules[module_name])
             else:
                 spec = importlib.util.spec_from_file_location(module_name, str(path))
+                if spec is None or spec.loader is None:
+                    logger.error("hot_load_from_path: no se pudo crear spec para '%s'", file_path)
+                    return []
                 mod = importlib.util.module_from_spec(spec)
                 sys.modules[module_name] = mod
                 spec.loader.exec_module(mod)
