@@ -18,10 +18,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -172,6 +174,7 @@ class WISCoreContainer:
         abilities: Any = None,
         proactivity: Any = None,
         aegis: Any = None,
+        goal_manager: Any = None,
     ) -> None:
         self.praxis = praxis
         self.cortex = cortex
@@ -179,6 +182,7 @@ class WISCoreContainer:
         self.abilities = abilities
         self.proactivity = proactivity
         self.aegis = aegis
+        self.goal_manager = goal_manager
 
 
 # Contenedor global por defecto; se reemplaza al arrancar la app.
@@ -215,6 +219,14 @@ class ChatResponse(BaseModel):
     results: List[Any] = []
     success: bool = True
     path: Optional[str] = None
+
+
+class GoalCreateRequest(BaseModel):
+    """Peticion para crear un objetivo del GoalManager."""
+
+    text: str
+    priority: int = 5
+    deadline: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +393,25 @@ def _abilities_as_list(abilities: Any) -> List[Dict[str, Any]]:
         return []
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Inicia y detiene el GoalManager en el event loop del servidor."""
+    core = get_core()
+    gm = getattr(core, "goal_manager", None)
+    if gm is not None and hasattr(gm, "start"):
+        try:
+            gm.start()
+            logger.info("GoalManager background loop started.")
+        except Exception as exc:
+            logger.warning("GoalManager start failed: %s", exc)
+    yield
+    if gm is not None and hasattr(gm, "stop"):
+        try:
+            await gm.stop()
+        except Exception as exc:
+            logger.warning("GoalManager stop failed: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Fabrica de la aplicacion FastAPI.
 # ---------------------------------------------------------------------------
@@ -409,6 +440,7 @@ def create_app(
         title="WIS Console",
         description="Servidor web de la consola de WIS.",
         version="1.0.0",
+        lifespan=_lifespan,
     )
 
     # CORS restringido: same-origin por defecto. Solo se permiten origenes
@@ -553,7 +585,35 @@ def create_app(
             core.aegis.set_mode(new_mode)
         if core.praxis and hasattr(core.praxis, 'safety'):
             core.praxis.safety.set_mode(new_mode)
+        reg = getattr(core, "abilities", None) or getattr(getattr(core, "praxis", None), "registry", None)
+        if reg:
+            try:
+                sys_ab = reg.get("system")
+                if sys_ab and hasattr(sys_ab, "set_mode"):
+                    sys_ab.set_mode(new_mode)
+            except Exception:
+                pass
         actual = core.aegis.mode if core.aegis else new_mode
+
+        # Persistir cambio de modo en config/settings.json
+        try:
+            from pathlib import Path
+            import json
+            settings_path = Path(__file__).resolve().parent.parent / "config" / "settings.json"
+            if settings_path.exists():
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if "security" not in cfg or not isinstance(cfg["security"], dict):
+                    cfg["security"] = {}
+                cfg["security"]["mode"] = actual
+                if "system_ability" not in cfg or not isinstance(cfg["system_ability"], dict):
+                    cfg["system_ability"] = {}
+                cfg["system_ability"]["mode"] = "autonomous" if actual in ("privileged", "autonomous") else "safe"
+                with open(settings_path, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=4)
+        except Exception:
+            pass
+
         broadcast_event("security.mode_changed", {"mode": actual})
         return {"mode": actual}
 
@@ -600,6 +660,85 @@ def create_app(
             return {"routines": []}
         return {"routines": core.proactivity.list_routines()}
 
+    @app.post("/api/goals")
+    async def create_goal(req: GoalCreateRequest, _: None = Depends(require_auth)) -> Dict[str, Any]:
+        """Crea un objetivo y genera su plan inmediatamente."""
+        core = get_core()
+        gm = getattr(core, "goal_manager", None)
+        if not gm:
+            raise HTTPException(status_code=503, detail="Goal manager no disponible.")
+        try:
+            goal = await gm.add_goal(
+                req.text,
+                priority=req.priority,
+                deadline=req.deadline,
+            )
+            return {"goal": goal}
+        except Exception as exc:
+            logger.exception("Error creando goal: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.get("/api/goals")
+    async def get_goals(_: None = Depends(require_auth)) -> Dict[str, Any]:
+        core = get_core()
+        gm = getattr(core, "goal_manager", None)
+        if not gm:
+            return {"goals": []}
+        try:
+            active_goals = gm.task_store.list_goals()
+            goals_data = []
+            for g in active_goals[:20]:
+                subtasks = gm.task_store.get_subtasks(g["id"])
+                progress = gm.task_store.goal_progress(g["id"])
+                goals_data.append({
+                    "id": g["id"],
+                    "text": g["text"],
+                    "status": g["status"],
+                    "priority": g["priority"],
+                    "summary": g.get("plan_summary", ""),
+                    "progress": progress,
+                    "subtasks": subtasks,
+                })
+            return {"goals": goals_data}
+        except Exception as exc:
+            return {"goals": [], "error": str(exc)}
+
+    @app.post("/api/upload")
+    async def upload_file(
+        file: UploadFile = File(...),
+        _: None = Depends(require_auth)
+    ) -> Dict[str, Any]:
+        """Sube un archivo o imagen a Data/uploads/ y retorna su ruta absoluta local."""
+        try:
+            uploads_dir = Path("Data/uploads")
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = int(time.time())
+            safe_filename = f"{timestamp}_{file.filename}"
+            target_path = uploads_dir / safe_filename
+
+            contents = await file.read()
+            with open(target_path, "wb") as f:
+                f.write(contents)
+
+            abs_path = str(target_path.resolve())
+            is_image = (file.content_type or "").startswith("image/") or any(
+                safe_filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+            )
+
+            logger.info("Archivo subido exitosamente: %s (%d bytes)", abs_path, len(contents))
+            return {
+                "success": True,
+                "path": abs_path,
+                "filename": file.filename,
+                "saved_as": safe_filename,
+                "size_bytes": len(contents),
+                "is_image": is_image,
+            }
+        except Exception as exc:
+            logger.exception("Error subiendo archivo: %s", exc)
+            return {"success": False, "error": str(exc)}
+
     @app.get("/api/auth/bootstrap")
     async def auth_bootstrap(request: Request) -> Dict[str, Any]:
         """Entrega el token de la consola SOLO a clientes loopback (localhost).
@@ -623,7 +762,10 @@ def create_app(
 
         listen_ability = None
         if core.abilities and hasattr(core.abilities, "get"):
-            listen_ability = core.abilities.get("listen")
+            try:
+                listen_ability = core.abilities.get("listen")
+            except KeyError:
+                pass
 
         if not listen_ability:
             raise HTTPException(status_code=400, detail="Habilidad 'listen' no registrada en el robot.")
@@ -640,6 +782,45 @@ def create_app(
         data = _normalize_response(raw)
         data["transcribed_text"] = text
         return data
+
+    @app.post("/api/tts")
+    async def tts_endpoint(req: Request, _: None = Depends(require_auth)) -> Any:
+        """Sintetiza texto a audio WAV usando Kokoro-82M ONNX (SIN reproducir en el servidor)
+        y lo devuelve como audio/wav para que el navegador lo reproduzca."""
+        from fastapi.responses import Response as FastAPIResponse
+
+        body = await req.json()
+        text = str(body.get("text", "")).strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="No text provided.")
+
+        core = get_core()
+        voice_ability = None
+        if core and core.abilities and hasattr(core.abilities, "get"):
+            try:
+                voice_ability = core.abilities.get("voice")
+            except KeyError:
+                pass
+
+        if not voice_ability:
+            raise HTTPException(status_code=503, detail="Voice ability not available.")
+
+        # Usar 'synthesize' (NO reproduce en el servidor — solo genera el WAV)
+        result = await _maybe_await(voice_ability.execute("synthesize", {"text": text}))
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail=result.get("message", "TTS failed."))
+
+        wav_path = result.get("data", {}).get("wav_path")
+        if not wav_path:
+            raise HTTPException(status_code=500, detail="No WAV path returned by TTS engine.")
+
+        wav_bytes = Path(wav_path).read_bytes()
+        return FastAPIResponse(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={"Cache-Control": "no-cache"},
+        )
+
 
     # ---------------------------------------------------------------------
     # WebSocket: canal bidireccional en tiempo real.
@@ -797,7 +978,13 @@ def start_server_thread(
     import uvicorn
 
     app = create_app(core, auth_token=auth_token, cors_origins=cors_origins)
-    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    target_port = port
+    while not _is_port_available(host, target_port):
+        logger.warning(f"Port {target_port} is busy, auto-allocating port {target_port + 1}...")
+        target_port += 1
+
+    logger.info(f"WIS server active on http://{host}:{target_port}/console/")
+    config = uvicorn.Config(app, host=host, port=target_port, log_level="warning")
     server = uvicorn.Server(config)
 
     thread = threading.Thread(target=server.run, daemon=True)

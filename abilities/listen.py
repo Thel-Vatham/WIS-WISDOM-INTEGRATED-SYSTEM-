@@ -22,7 +22,7 @@ except ImportError:
 class ListenAbility(Ability):
     """Habilidad de escucha y reconocimiento de voz (STT)."""
 
-    def __init__(self, language: str = "es-ES") -> None:
+    def __init__(self, language: str = "en-US") -> None:
         self._language = language
         self._recognizer: Optional[Any] = None
         if _SR_AVAILABLE:

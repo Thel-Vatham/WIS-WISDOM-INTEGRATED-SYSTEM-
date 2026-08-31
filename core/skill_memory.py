@@ -45,7 +45,8 @@ _TEMPORAL_WORDS = {
     "hoy", "ayer", "mañana", "manana",
     "today", "yesterday", "tomorrow",
     "now", "ahora",  # el estado actual cambia de un momento a otro
-    "fecha",         # pide la fecha del momento
+    "fecha", "date", # pide la fecha del momento
+    "time", "hora", "minuto", "segundo", # pide la hora
 }
 
 

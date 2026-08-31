@@ -90,6 +90,22 @@ class DesktopAbility(Ability):
              "params": {"title": "string", "timeout": "int?"}},
             {"action": "read_window", "description": "Leer contenido de ventana activa",
              "params": {}},
+            {
+                "action": "verified_action",
+                "description": (
+                    "Ejecuta una accion de GUI con verificacion visual pre/post usando screenshot + analisis VLM. "
+                    "Imprescindible para apps complejas (Unity, LTspice, Blender, etc.). "
+                    "Captura pantalla antes, ejecuta la accion, captura pantalla despues, "
+                    "compara visualmente y confirma si el objetivo fue logrado."
+                ),
+                "params": {
+                    "window_title": "string — titulo de la ventana objetivo",
+                    "action_type": "string — 'click', 'shortcut', 'type', o 'key'",
+                    "action_params": "object — parametros de la accion (x, y, text, keys, etc.)",
+                    "verify_prompt": "string — descripcion de que debe observarse en la pantalla para confirmar exito",
+                    "delay_ms": "int? — ms de espera entre accion y screenshot de verificacion (default 800)",
+                }
+            },
         ]
 
     async def execute(self, action: str, params: dict) -> dict:
@@ -102,6 +118,12 @@ class DesktopAbility(Ability):
             return {"success": False, "data": None, "message": f"Error desktop: {exc}"}
 
     def _execute_sync(self, action: str, params: dict) -> str:
+        if _UI_AUTO_OK:
+            with auto.UIAutomationInitializerInThread():
+                return self._execute_sync_inner(action, params)
+        return self._execute_sync_inner(action, params)
+
+    def _execute_sync_inner(self, action: str, params: dict) -> str:
         action = (action or "").lower().strip()
 
         if action == "type":
@@ -116,6 +138,9 @@ class DesktopAbility(Ability):
             return self._focus_wait(params)
         elif action == "read_window":
             return self._read_window(params)
+        elif action == "verified_action":
+            import asyncio
+            return asyncio.get_event_loop().run_until_complete(self._verified_action(params))
         return f"[ERROR] Accion '{action}' no soportada en desktop."
 
     # ---- UIAutomation: busqueda logica de controles -----------------------
@@ -483,3 +508,123 @@ class DesktopAbility(Ability):
             return f"[OK] Ventana: {window_name}\n{content}"
         except Exception as exc:
             return f"[ERROR] No se pudo leer la ventana: {exc}"
+
+    # ---- Accion Verificada con Visión: screenshot → action → screenshot → VLM ----
+
+    async def _verified_action(self, params: dict) -> str:
+        """
+        Ejecuta una accion de GUI con verificacion visual pre/post.
+        Ciclo:
+          1. Focus en la ventana objetivo
+          2. Screenshot PRE (estado actual)
+          3. Ejecuta la accion (click, shortcut, type, key)
+          4. Espera delay_ms para que la UI reaccione
+          5. Screenshot POST
+          6. Llama al VLM (Florence-2 o analyze_scene_vlm) para verificar si el objetivo fue alcanzado
+          7. Retorna resultado con descripcion visual del estado POST
+        """
+        import asyncio
+        import base64
+        import tempfile
+        from pathlib import Path
+
+        window_title = params.get("window_title", "")
+        action_type = str(params.get("action_type", "")).lower()
+        action_params = params.get("action_params", {})
+        verify_prompt = params.get("verify_prompt", "Describe what changed on screen after the action.")
+        delay_ms = int(params.get("delay_ms", 800))
+
+        steps = []
+
+        # 1. Focus ventana objetivo
+        if window_title:
+            focus_result = self._focus_wait({"title": window_title, "timeout": 5})
+            steps.append(f"Focus: {focus_result}")
+            await asyncio.sleep(0.3)
+
+        # 2. Screenshot PRE
+        pre_path = None
+        try:
+            if _PYAUTOGUI_OK:
+                pre_img = _gui.screenshot()
+                pre_file = Path(tempfile.gettempdir()) / "wis_va_pre.png"
+                pre_img.save(str(pre_file))
+                pre_path = str(pre_file)
+                steps.append(f"Screenshot PRE: {pre_path}")
+        except Exception as exc:
+            steps.append(f"Screenshot PRE failed: {exc}")
+
+        # 3. Ejecutar la accion
+        try:
+            if action_type == "click":
+                x = action_params.get("x")
+                y = action_params.get("y")
+                button = action_params.get("button", "left")
+                if x is not None and y is not None and _PYAUTOGUI_OK:
+                    _gui.click(int(x), int(y), button=button)
+                    steps.append(f"Click({x},{y},{button})")
+                else:
+                    res = self._click(action_params)
+                    steps.append(f"Click: {res}")
+
+            elif action_type == "shortcut":
+                keys = action_params.get("keys", [])
+                if keys and _PYAUTOGUI_OK:
+                    _gui.hotkey(*keys)
+                    steps.append(f"Shortcut: {'+'.join(keys)}")
+
+            elif action_type == "type":
+                text = action_params.get("text", "")
+                if text and _PYAUTOGUI_OK:
+                    _gui.typewrite(text, interval=0.05)
+                    steps.append(f"Type: '{text}'")
+
+            elif action_type == "key":
+                key = action_params.get("key", "")
+                if key and _PYAUTOGUI_OK:
+                    _gui.press(key)
+                    steps.append(f"Key: {key}")
+
+            else:
+                steps.append(f"Unknown action_type: '{action_type}'")
+
+        except Exception as exc:
+            steps.append(f"Action error: {exc}")
+
+        # 4. Esperar reaccion de la UI
+        await asyncio.sleep(delay_ms / 1000.0)
+
+        # 5. Screenshot POST
+        post_path = None
+        try:
+            if _PYAUTOGUI_OK:
+                post_img = _gui.screenshot()
+                post_file = Path(tempfile.gettempdir()) / "wis_va_post.png"
+                post_img.save(str(post_file))
+                post_path = str(post_file)
+                steps.append(f"Screenshot POST: {post_path}")
+        except Exception as exc:
+            steps.append(f"Screenshot POST failed: {exc}")
+
+        # 6. VLM Verification — usar analyze_scene_vlm si vision ability disponible
+        vlm_result = "VLM verification skipped (no vision ability injected)."
+        if post_path:
+            try:
+                # Intentar importar y usar vision si está disponible globalmente
+                from abilities.vision import VisionAbility
+                vision = VisionAbility()
+                vlm_res = await vision.execute("analyze_scene_vlm", {
+                    "prompt": verify_prompt,
+                    "image_path": post_path,
+                })
+                if vlm_res.get("success"):
+                    analysis = vlm_res.get("data", {}).get("analysis") or vlm_res.get("message", "")
+                    vlm_result = f"VLM says: {analysis}"
+                else:
+                    vlm_result = f"VLM error: {vlm_res.get('message', 'unknown')}"
+            except Exception as exc:
+                vlm_result = f"VLM unavailable: {exc}"
+
+        steps.append(vlm_result)
+
+        return "[VERIFIED_ACTION]\n" + "\n".join(steps)

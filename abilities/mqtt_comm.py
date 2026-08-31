@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import queue
 from typing import Any, Dict, List, Optional
 
 from .base import HardwareAbility

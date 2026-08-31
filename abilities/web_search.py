@@ -33,7 +33,7 @@ class WebSearchAbility(Ability):
     @property
     def description(self) -> str:
         provider = "Tavily API" if self._tavily_key else "DuckDuckGo"
-        return f"Busqueda web avanzada ({provider}) con fallback multi-proveedor."
+        return f"Advanced web search ({provider}) with multi-provider fallback."
 
     @property
     def domain(self) -> str:
@@ -41,9 +41,9 @@ class WebSearchAbility(Ability):
 
     def get_schema(self) -> list:
         return [
-            {"action": "search", "description": "Buscar en la web",
+            {"action": "search", "description": "Search the web",
              "params": {"query": "string"}},
-            {"action": "search_images", "description": "Buscar imagenes",
+            {"action": "search_images", "description": "Search for images",
              "params": {"query": "string"}},
         ]
 
@@ -51,17 +51,17 @@ class WebSearchAbility(Ability):
         action = (action or "search").lower().strip()
         query = str(params.get("query", "") or params.get("text", "")).strip()
         if not query:
-            return {"success": False, "data": None, "message": "Falta la consulta 'query'."}
+            return {"success": False, "data": None, "message": "Missing 'query' parameter."}
 
         try:
             if action == "search_images":
                 result = await asyncio.to_thread(self._search_images, query)
             else:
                 result = await asyncio.to_thread(self._search, query)
-            ok = bool(result and not result.startswith("No encontre"))
+            ok = bool(result and not result.startswith("No reliable results found"))
             return {"success": ok, "data": result, "message": result}
         except Exception as exc:
-            return {"success": False, "data": None, "message": f"Error busqueda: {exc}"}
+            return {"success": False, "data": None, "message": f"Search error: {exc}"}
 
     def _search(self, query: str) -> str:
         if self._tavily_key:
@@ -77,7 +77,7 @@ class WebSearchAbility(Ability):
         result = self._search_wikipedia(query)
         if result:
             return result
-        return f"No encontre resultados confiables para: '{query}'"
+        return f"No reliable results found for: '{query}'"
 
     def _search_tavily(self, query: str) -> str | None:
         try:
@@ -87,14 +87,14 @@ class WebSearchAbility(Ability):
                 query=query, search_depth="basic",
                 max_results=3, include_answer=True,
             )
-            lines = [f"**Busqueda:** {query}\n"]
+            lines = [f"**Search:** {query}\n"]
             if response.get("answer"):
-                lines.append(f"**Resumen:** {response['answer']}\n")
+                lines.append(f"**Summary:** {response['answer']}\n")
             results = response.get("results", [])[:3]
             if results:
-                lines.append("**Fuentes:**")
+                lines.append("**Sources:**")
                 for item in results:
-                    title = item.get("title", "Sin titulo")
+                    title = item.get("title", "Untitled")
                     snippet = item.get("content", "")[:220].strip()
                     url = item.get("url", "")
                     lines.append(f"- **{title}**")
@@ -110,9 +110,9 @@ class WebSearchAbility(Ability):
     def _search_duckduckgo(self, query: str) -> str | None:
         try:
             try:
-                from ddgs import DDGS
+                from duckduckgo_search import DDGS  # paquete declarado en requirements
             except ImportError:
-                from duckduckgo_search import DDGS
+                from ddgs import DDGS  # nombre moderno del mismo paquete
             ddgs = DDGS()
             results = []
             seen = set()
@@ -127,9 +127,9 @@ class WebSearchAbility(Ability):
                     break
             if not results:
                 return None
-            lines = [f"**Busqueda:** {query}\n", "**Resultados:**"]
+            lines = [f"**Search:** {query}\n", "**Results:**"]
             for item in results:
-                title = item.get("title", "Sin titulo")
+                title = item.get("title", "Untitled")
                 body = item.get("body", "")[:220].strip()
                 url = item.get("href", "")
                 lines.append(f"- **{title}**")
@@ -160,7 +160,7 @@ class WebSearchAbility(Ability):
                 urls_raw = re.findall(r'uddg=([^&"]+)', html)
             if not titles:
                 return None
-            lines = [f"**Busqueda:** {query}\n", "**Resultados (DuckDuckGo HTML):**"]
+            lines = [f"**Search:** {query}\n", "**Results (DuckDuckGo HTML):**"]
             for i in range(min(len(titles), 3)):
                 title = re.sub("<[^<]+?>", "", titles[i]).strip()
                 snippet = ""
@@ -186,9 +186,9 @@ class WebSearchAbility(Ability):
     def _search_images(self, query: str) -> str:
         try:
             try:
-                from ddgs import DDGS
+                from duckduckgo_search import DDGS  # paquete declarado en requirements
             except ImportError:
-                from duckduckgo_search import DDGS
+                from ddgs import DDGS  # nombre moderno del mismo paquete
             ddgs = DDGS()
             results = []
             for item in ddgs.images(query, max_results=6):
@@ -196,24 +196,24 @@ class WebSearchAbility(Ability):
                 if not img_url:
                     continue
                 results.append({
-                    "title": item.get("title", "Imagen"),
+                    "title": item.get("title", "Image"),
                     "image": img_url,
                     "source": item.get("url", ""),
                 })
                 if len(results) >= 3:
                     break
             if not results:
-                return f"No encontre imagenes para: '{query}'"
-            lines = [f"**Imagenes:** {query}\n"]
+                return f"No images found for: '{query}'"
+            lines = [f"**Images:** {query}\n"]
             for item in results:
                 lines.append(f"- **{item['title']}**")
                 lines.append(f"  ![]({item['image']})")
                 if item["source"]:
-                    lines.append(f"  Fuente: {item['source']}")
+                    lines.append(f"  Source: {item['source']}")
             return "\n".join(lines)
         except Exception as exc:
             logger.error(f"DuckDuckGo images error: {exc}")
-            return f"No encontre imagenes para: '{query}'"
+            return f"No images found for: '{query}'"
 
     def _search_wikipedia(self, query: str) -> str | None:
         try:
@@ -228,7 +228,7 @@ class WebSearchAbility(Ability):
             results = response.json().get("query", {}).get("search", [])
             if not results:
                 return None
-            lines = [f"**Busqueda (Wikipedia):** {query}\n"]
+            lines = [f"**Search (Wikipedia):** {query}\n"]
             for item in results[:3]:
                 title = item.get("title", "")
                 snippet = re.sub("<[^<]+>", "", item.get("snippet", ""))[:220].strip()

@@ -14,10 +14,10 @@
         "enabled": true,
         "rate": 170,
         "language": "en",
-        "voice_name": "Microsoft Zira Desktop - English (United States)"
+        "voice_name": "en-US-JennyNeural"
     },
     "security": {
-        "mode": "secure"
+        "mode": "privileged"
     },
     "agentic": {
         "max_steps": 10,
@@ -28,7 +28,7 @@
         "check_interval_s": 60
     },
     "system_ability": {
-        "mode": "safe",
+        "mode": "autonomous",
         "extra_allowed": []
     },
     "server": {

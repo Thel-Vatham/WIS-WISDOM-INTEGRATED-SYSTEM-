@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 
 # Asegura que el directorio raiz este en sys.path para los imports.
@@ -197,6 +198,12 @@ def build_core(settings: dict) -> dict:
     vault = SkillMemory(db_path=db_path)
     logger.info(f"SkillMemory ready (healthy: {vault.stats().get('healthy', 0)} skills)")
 
+    # --- Local CPU LLM Engine ---
+    from core.llm_client import LocalLLMClient
+    local_nexus = LocalLLMClient()
+    threading.Thread(target=local_nexus.ensure_model, daemon=True).start()
+    logger.info("Local CPU LLM Engine initialized (models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf)")
+
     # --- LLM Client ---
     nexus = LLMClient(
         base_url=llm_cfg.get("base_url", "https://api.deepseek.com"),
@@ -206,6 +213,7 @@ def build_core(settings: dict) -> dict:
     router = ModelRouter(
         fast_model=llm_cfg.get("model", "deepseek-chat"),
         strong_model=llm_cfg.get("fallback_model", "deepseek-chat"),
+        local_client=local_nexus,
     )
     logger.info(f"LLMClient ready (model: {llm_cfg.get('model', 'deepseek-chat')})")
 
@@ -352,25 +360,74 @@ def _register_default_abilities(registry: AbilityRegistry, settings: dict) -> No
     except Exception as e:
         logger.warning(f"WebSearchAbility not loaded: {e}")
 
+    # File Manager (native file/dir operations)
+    try:
+        from abilities.file_manager import FileManagerAbility
+        registry.register(FileManagerAbility())
+    except Exception as e:
+        logger.warning(f"FileManagerAbility not loaded: {e}")
 
-def run_cli_session(praxis: ActionPipeline) -> None:
-    """Modo consola interactivo en terminal."""
-    print("=== WIS CLI Mode ===")
-    print("Type your message, or 'exit' / 'quit' to stop.\n")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    while True:
-        try:
-            user_input = input("You > ").strip()
+    # Meta-programming: BuilderAbility lets WIS create new abilities
+    try:
+        from abilities.builder import BuilderAbility
+        registry.register(BuilderAbility(registry))
+    except Exception as e:
+        logger.warning(f"BuilderAbility not loaded: {e}")
+
+    # Auto-discovery: DiscoveryAbility coordinates new integrations
+    try:
+        from abilities.discovery import DiscoveryAbility
+        registry.register(DiscoveryAbility(registry))
+    except Exception as e:
+        logger.warning(f"DiscoveryAbility not loaded: {e}")
+
+    # Hardware protocols (Serial/UART + MQTT)
+    try:
+        from abilities.serial_comm import SerialCommAbility
+        registry.register(SerialCommAbility())
+    except Exception as e:
+        logger.warning(f"SerialCommAbility not loaded: {e}")
+
+    try:
+        from abilities.mqtt_comm import MQTTCommAbility
+        registry.register(MQTTCommAbility())
+    except Exception as e:
+        logger.warning(f"MQTTCommAbility not loaded: {e}")
+
+    # Custom abilities generated dynamically (robots, IoT, etc.)
+    try:
+        registry.load_custom_directory()
+    except Exception as e:
+        logger.warning(f"Custom abilities not loaded: {e}")
+
+
+async def _cli_session(praxis: ActionPipeline, goal_manager) -> None:
+    """Bucle interactivo CLI ejecutado dentro de un event loop."""
+    if goal_manager is not None:
+        goal_manager.start()
+    try:
+        while True:
+            user_input = (await asyncio.to_thread(input, "You > ")).strip()
             if not user_input or user_input.lower() in ("exit", "quit"):
                 break
-            result = loop.run_until_complete(praxis.process(user_input))
+            result = await praxis.process(user_input)
             print(f"\nWIS [{result.get('path_used', 'path')}]: {result.get('response')}")
             if result.get("calls"):
                 print(f"Executed calls: {result['calls']}")
             print()
-        except (KeyboardInterrupt, EOFError):
-            break
+    finally:
+        if goal_manager is not None:
+            await goal_manager.stop()
+
+
+def run_cli_session(praxis: ActionPipeline, goal_manager=None) -> None:
+    """Modo consola interactivo en terminal."""
+    print("=== WIS CLI Mode ===")
+    print("Type your message, or 'exit' / 'quit' to stop.\n")
+    try:
+        asyncio.run(_cli_session(praxis, goal_manager))
+    except (KeyboardInterrupt, EOFError):
+        pass
     print("WIS CLI session ended.")
 
 
@@ -523,7 +580,7 @@ def setup_terminal_trace() -> None:
 
         elif evt == "pipeline.response_ready":
             trace_logger.info("RESPONSE | success=%s | path=%s | steps=%s\n--- FINAL RESPONSE ---\n%s\n--- END RESPONSE ---",
-                              data.get("success"), data.get("path"), data.get("steps"),
+                              data.get("success"), data.get("path_used"), data.get("steps_used"),
                               data.get("response", ""))
 
         elif evt in ("pipeline.reflexive_hit", "pipeline.known_hit",
@@ -557,7 +614,7 @@ def main() -> None:
     atexit.register(close_core, core)
 
     if "--cli" in sys.argv:
-        run_cli_session(core["praxis"])
+        run_cli_session(core["praxis"], core["goal_manager"])
         return
 
     # --- Arrancar consola ---
@@ -578,6 +635,7 @@ def main() -> None:
         abilities=core["registry"],
         proactivity=core.get("proactivity"),
         aegis=core["aegis"],
+        goal_manager=core["goal_manager"],
     )
 
     if "--server" in sys.argv:

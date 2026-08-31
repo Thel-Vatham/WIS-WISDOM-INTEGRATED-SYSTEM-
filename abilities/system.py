@@ -51,7 +51,7 @@ class SystemAbility(Ability):
         timeout: int = 10,
         extra_allowed: Optional[set] = None,
     ):
-        self._mode = mode if mode in (self.MODE_SAFE, self.MODE_AUTONOMOUS) else self.MODE_SAFE
+        self.set_mode(mode)
         self._timeout = timeout
         self._allowed = set(self.DEFAULT_ALLOWED)
         if extra_allowed:
@@ -61,6 +61,19 @@ class SystemAbility(Ability):
     @property
     def mode(self) -> str:
         return self._mode
+
+    @mode.setter
+    def mode(self, val: str) -> None:
+        self.set_mode(val)
+
+    def set_mode(self, val: str) -> None:
+        m = str(val or "safe").strip().lower()
+        if m in ("secure", "safe"):
+            self._mode = self.MODE_SAFE
+        elif m in ("privileged", "autonomous"):
+            self._mode = self.MODE_AUTONOMOUS
+        else:
+            self._mode = self.MODE_SAFE
 
     def _first_token(self, command: str) -> str:
         """Extrae y normaliza el primer token de un comando (basename sin extension)."""
@@ -82,7 +95,7 @@ class SystemAbility(Ability):
 
     def _is_unrestricted_allowed(self) -> bool:
         """True solo si el modo habilita ejecucion irrestricta (PowerShell/Python)."""
-        return self._mode == self.MODE_AUTONOMOUS
+        return (self._mode or "").strip().lower() in (self.MODE_AUTONOMOUS, "privileged", "autonomous")
 
     # ------------------------------------------------------------------ #
     # Metadatos requeridos por Ability
@@ -205,7 +218,7 @@ class SystemAbility(Ability):
             return {"success": False, "data": None, "message": "Comando vacio."}
 
         # --- Whitelist enforcement (modo safe) ---
-        if self._mode == self.MODE_SAFE:
+        if not self._is_unrestricted_allowed():
             token = self._first_token(command)
             if not token:
                 return {"success": False, "data": None, "message": "Comando invalido."}
@@ -867,12 +880,12 @@ class SystemAbility(Ability):
                 "data": {"cpu_percent": cpu, "ram_percent": ram, "disk_percent": disk},
                 "message": f"Recursos del sistema: CPU {cpu}%, RAM {ram}%, Disco {disk}%.",
             }
-        except Exception:
-            # Fallback si psutil no esta disponible
+        except Exception as exc:
+            # Nunca inventar metricas: fallar honestamente si psutil no esta disponible.
             return {
-                "success": True,
-                "data": {"cpu_percent": 15.0, "ram_percent": 45.0, "disk_percent": 50.0, "virtual": True},
-                "message": "Metricas estimadas de recursos del sistema.",
+                "success": False,
+                "data": None,
+                "message": f"No se pudieron leer las metricas del sistema (psutil no disponible): {exc}",
             }
 
     # ------------------------------------------------------------------ #

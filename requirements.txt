@@ -1,16 +1,60 @@
+# =============================================================================
+# WIS v2.0.0 - Dependencias de Python
+# -----------------------------------------------------------------------------
+# Verificacion automatizada al arranque: core/dependencies.py
+# =============================================================================
+
+# ---- Servidor y consola web -------------------------------------------------
 fastapi>=0.100.0
-uvicorn[standard]>=0.22.0
-websockets>=12.0
-httpx>=0.24.0
-fastembed>=0.2.0
-pywebview>=4.0.0
-python-dotenv>=1.0.0
-pyttsx3>=2.90
-edge-tts>=6.1.0
+uvicorn[standard]>=0.20.0
+python-multipart>=0.0.6
+httpx>=0.25.0
+pywebview>=5.0.0
+
+# ---- Cognicion / LLM --------------------------------------------------------
+fastembed>=0.3.0
+ctransformers>=0.2.27
+
+# ---- Memoria y analisis numerico (uso directo en core/ y abilities/) --------
+numpy>=1.24.0,<3.0.0
+pillow>=10.0.0
+psutil>=5.9.0
+
+# ---- Web / Busqueda ---------------------------------------------------------
+duckduckgo_search>=6.0.0
+requests>=2.31.0
+
+# ---- Voz (TTS/STT) ----------------------------------------------------------
+kokoro-onnx>=0.5.0
+soundfile>=0.12.0
+SpeechRecognition>=3.10.0
+PyAudio>=0.2.13
+
+# ---- Vision -----------------------------------------------------------------
 opencv-python>=4.8.0
-duckduckgo_search>=4.0.0
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
+
+# ---- Navegador / Automatizacion de escritorio -------------------------------
 playwright>=1.40.0
-pyautogui>=0.9.0
-pyperclip>=1.8.0
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+comtypes>=1.2.0
+pycaw>=20240210
+uiautomation>=2.0.18
+pywin32>=306
+
+# ---- Comunicaciones ---------------------------------------------------------
+paho-mqtt>=2.0.0
+pyserial>=3.5
+
+# ---- Tests ------------------------------------------------------------------
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+
+# =============================================================================
+# Dependencias OPCIONALES (no requeridas para el arranque base):
+# -----------------------------------------------------------------------------
+#   sounddevice   -> reproduccion de audio en voice.py (si falta, usa fallback
+#                    por subprocess/winsound). Instalar: pip install sounddevice
+#   torch, transformers -> Florence-2 vision (abilities/vision.py, lazy load).
+#                    Instalar: pip install torch transformers
+# =============================================================================

@@ -77,6 +77,22 @@ JSON format:
 {"steps": ["Step 1 text", "Step 2 text", "Step 3 text"]}
 """
 
+_REEVALUATOR_SYSTEM = """\
+You are an adaptive plan evaluator for WIS, a cognitive assistant.
+Given an overall goal, a step that was just executed with its actual outcome/output, and the remaining planned steps:
+Determine if the remaining steps are still valid and sufficient, or if they must be adjusted, replaced, or added to.
+
+Rules:
+- Respond ONLY with a JSON object, no markdown fences, no commentary.
+- If the remaining steps are still accurate and sufficient, respond with:
+  {"valid": true, "reason": "Steps remain appropriate", "new_steps": []}
+- If the plan must change due to a failure, new data, or changed context, respond with:
+  {"valid": false, "reason": "Short explanation why plan changed", "new_steps": ["Updated step 1", "Updated step 2"]}
+
+JSON format:
+{"valid": true, "reason": "...", "new_steps": ["Step text"]}
+"""
+
 
 class GoalManager:
     """Orquestador de objetivos autónomos con planificación y ejecución."""
@@ -338,9 +354,14 @@ class GoalManager:
 
             result = await self._run_subtask_with_retry(subtask)
 
-            # Tras ejecutar, verificar si el goal quedó completo.
-            remaining = self.task_store.get_next_pending_subtask(goal_id)
-            if not remaining:
+            # Protocolo Stop, Check & Think: Re-evaluar si hay pasos pendientes
+            remaining = [s for s in self.task_store.get_subtasks(goal_id) if s["status"] == "pending"]
+            if remaining:
+                await self._stop_check_and_think(goal, subtask, result, remaining)
+
+            # Tras ejecutar y re-evaluar, verificar si el goal quedó completo.
+            remaining_after = self.task_store.get_next_pending_subtask(goal_id)
+            if not remaining_after:
                 await self._check_completion(goal_id)
 
             return result
@@ -420,6 +441,91 @@ class GoalManager:
             "status": "failed",
             "error": last_error,
         }
+
+    # ────────────────────────────────────────────────────────────────────
+    # STOP, CHECK & THINK — Re-evaluación dinámica del plan por paso
+    # ────────────────────────────────────────────────────────────────────
+
+    async def _stop_check_and_think(
+        self,
+        goal: dict,
+        completed_subtask: dict,
+        subtask_result: dict,
+        remaining_subtasks: List[dict],
+    ) -> None:
+        """Protocolo 'Stop, Check & Think': evalúa si el resultado del paso actual
+        invalida o modifica los pasos restantes del plan."""
+        goal_text = goal.get("text", "")
+        step_text = completed_subtask.get("text", "")
+        status = subtask_result.get("status", "")
+        outcome = subtask_result.get("result") or subtask_result.get("error") or ""
+        remaining_texts = [s["text"] for s in remaining_subtasks]
+
+        user_content = (
+            f"Overall Goal: {goal_text}\n"
+            f"Step Just Executed: {step_text}\n"
+            f"Execution Status: {status}\n"
+            f"Outcome/Output: {outcome[:500]}\n"
+            f"Remaining Planned Steps: {json.dumps(remaining_texts, ensure_ascii=False)}"
+        )
+
+        messages = [
+            {"role": "system", "content": _REEVALUATOR_SYSTEM},
+            {"role": "user", "content": user_content},
+        ]
+
+        try:
+            raw = await asyncio.wait_for(
+                self._collect_llm_response(messages, temperature=0.2),
+                timeout=PLAN_TIMEOUT_S,
+            )
+            data = self._parse_json_object(raw)
+            if data and not data.get("valid", True):
+                new_steps = data.get("new_steps") or []
+                reason = data.get("reason", "Plan adjusted after step evaluation.")
+                logger.info(
+                    "Stop, Check & Think: Re-evaluación cambió el plan del goal %s (Razón: %s)",
+                    goal["id"], reason
+                )
+
+                # Cancelar/omitir subtareas pendientes obsoletas
+                for sub in remaining_subtasks:
+                    self.task_store.update_subtask(sub["id"], status="skipped")
+
+                # Agregar las nuevas subtareas si las hay
+                if new_steps:
+                    clean_new_steps = [str(s)[:300] for s in new_steps[:MAX_PLAN_STEPS]]
+                    added = self.task_store.add_subtasks_batch(goal["id"], clean_new_steps)
+                    logger.info("Nuevos pasos agregados al goal %s: %d", goal["id"], len(added))
+
+                # Emitir evento de plan ajustado
+                event_bus.emit("goal.plan_adjusted", {
+                    "goal_id": goal["id"],
+                    "reason": reason,
+                    "new_steps": new_steps,
+                })
+
+                # Actualizar resumen del goal
+                updated_subtasks = self.task_store.get_subtasks(goal["id"])
+                summary = self._build_plan_summary(goal, updated_subtasks)
+                self.task_store.update_goal_summary(goal["id"], summary)
+
+        except Exception as exc:
+            logger.warning("Stop, Check & Think re-evaluation warning for goal %s: %s", goal["id"], exc)
+
+    @staticmethod
+    def _parse_json_object(raw: str) -> Optional[dict]:
+        """Extrae un diccionario JSON de la respuesta LLM."""
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+        return None
 
     # ────────────────────────────────────────────────────────────────────
     # VERIFY — comprobación de completitud

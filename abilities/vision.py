@@ -35,6 +35,11 @@ class VisionAbility(Ability):
         self._face_cascade = None  # Clasificador Haar (lazy load)
         self._cascade_ready = False
 
+        # Florence-2 Model & Processor (lazy load)
+        self._florence_model = None
+        self._florence_processor = None
+        self._florence_device = None
+
     # ------------------------------------------------------------------ #
     # Metadatos requeridos por Ability
     # ------------------------------------------------------------------ #
@@ -169,6 +174,104 @@ class VisionAbility(Ability):
         return result
 
     # ------------------------------------------------------------------ #
+    # Florence-2 Vision Helpers
+    # ------------------------------------------------------------------ #
+    def _load_florence_model_sync(self, model_id: str = "microsoft/Florence-2-base") -> tuple:
+        """Carga y cachea el modelo y procesador Florence-2 (lazy loading)."""
+        if self._florence_model is not None and self._florence_processor is not None:
+            return self._florence_model, self._florence_processor, self._florence_device
+
+        try:
+            import torch  # type: ignore
+            from transformers import AutoProcessor, AutoModelForCausalLM  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "Florence-2 requires 'torch' and 'transformers'. "
+                f"Please install via 'pip install torch transformers'. Details: {exc}"
+            )
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        torch_dtype = torch.float16 if device == "cuda" else torch.float32
+
+        # CPU Optimization: set max threads if running on CPU
+        if device == "cpu":
+            try:
+                num_threads = min(8, os.cpu_count() or 4)
+                torch.set_num_threads(num_threads)
+            except Exception:
+                pass
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, trust_remote_code=True, torch_dtype=torch_dtype
+        ).to(device)
+
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+        self._florence_model = model
+        self._florence_processor = processor
+        self._florence_device = device
+        return model, processor, device
+
+    def _run_florence_sync(
+        self,
+        image_path_or_frame: Any,
+        task_prompt: str = "<DENSE_REGION_CAPTION>",
+        text_input: str = "",
+        model_id: str = "microsoft/Florence-2-base",
+    ) -> dict:
+        """Ejecuta una tarea de Florence-2 sobre una imagen o fotograma."""
+        from PIL import Image  # type: ignore
+
+        if isinstance(image_path_or_frame, str) and os.path.exists(image_path_or_frame):
+            pil_img = Image.open(image_path_or_frame).convert("RGB")
+        elif hasattr(image_path_or_frame, "shape"):
+            cv2 = self._import_cv2()
+            if cv2 is not None:
+                rgb = cv2.cvtColor(image_path_or_frame, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb)
+            else:
+                pil_img = Image.fromarray(image_path_or_frame)
+        elif isinstance(image_path_or_frame, Image.Image):
+            pil_img = image_path_or_frame
+        else:
+            raise ValueError(f"Formato de imagen inválido para Florence-2: {type(image_path_or_frame)}")
+
+        model, processor, device = self._load_florence_model_sync(model_id)
+
+        prompt = task_prompt + (f" {text_input}" if text_input else "")
+        inputs = processor(text=prompt, images=pil_img, return_tensors="pt")
+
+        import torch  # type: ignore
+        if device == "cuda":
+            inputs = {k: v.to(device, torch.float16) if v.dtype == torch.float32 else v.to(device) for k, v in inputs.items()}
+        else:
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            generated_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                num_beams=3,
+                do_sample=False,
+            )
+
+        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        parsed_answer = processor.post_process_generation(
+            generated_text,
+            task=task_prompt,
+            image_size=(pil_img.width, pil_img.height),
+        )
+
+        return {
+            "task": task_prompt,
+            "text_input": text_input,
+            "parsed": parsed_answer,
+            "raw_text": generated_text,
+            "device": device,
+        }
+
+    # ------------------------------------------------------------------ #
     # Ejecucion de acciones
     # ------------------------------------------------------------------ #
     async def execute(self, action: str, params: dict) -> dict:
@@ -188,6 +291,10 @@ class VisionAbility(Ability):
             return await self._action_describe(params)
         if action in ("analyze_scene_vlm", "vlm", "analyze_vlm"):
             return await self._action_analyze_scene_vlm(params)
+        if action in ("florence_analyze", "florence"):
+            return await self._action_florence_analyze(params)
+        if action in ("florence_grounding", "grounding", "find_element_visual"):
+            return await self._action_florence_grounding(params)
 
         return {
             "success": False,
@@ -313,6 +420,74 @@ class VisionAbility(Ability):
         except Exception as exc:
             return {"success": False, "data": None, "message": f"Error procesando VLM: {exc}"}
 
+    async def _action_florence_analyze(self, params: dict) -> dict:
+        """Ejecuta tareas analíticas de Florence-2 (<DENSE_REGION_CAPTION>, <OCR_WITH_REGION>, etc.)."""
+        task_prompt = str(params.get("task_prompt", "<DENSE_REGION_CAPTION>")).strip()
+        text_input = str(params.get("text_input", "")).strip()
+        image_path = params.get("image_path")
+
+        image_target = image_path
+        if not image_target or not os.path.exists(image_target):
+            cv2_module, frame = await asyncio.to_thread(self._capture_sync)
+            if frame is None:
+                return {"success": False, "data": None, "message": "No image_path provided and camera capture failed."}
+            image_target = frame
+
+        try:
+            result = await asyncio.to_thread(
+                self._run_florence_sync,
+                image_target,
+                task_prompt,
+                text_input,
+            )
+            return {
+                "success": True,
+                "data": result,
+                "message": f"Florence-2 task '{task_prompt}' executed successfully on {result.get('device', 'cpu')}.",
+            }
+        except Exception as exc:
+            return {"success": False, "data": None, "message": f"Florence-2 execution failed: {exc}"}
+
+    async def _action_florence_grounding(self, params: dict) -> dict:
+        """Encuentra coordenadas de bounding box [x1, y1, x2, y2] para un elemento visual o texto."""
+        phrase = str(params.get("phrase") or params.get("target") or params.get("text_input") or "").strip()
+        if not phrase:
+            return {"success": False, "data": None, "message": "Parameter 'phrase' or 'target' is required for florence_grounding."}
+
+        image_path = params.get("image_path")
+        image_target = image_path
+        if not image_target or not os.path.exists(image_target):
+            cv2_module, frame = await asyncio.to_thread(self._capture_sync)
+            if frame is None:
+                return {"success": False, "data": None, "message": "No image_path provided and camera capture failed."}
+            image_target = frame
+
+        try:
+            result = await asyncio.to_thread(
+                self._run_florence_sync,
+                image_target,
+                "<CAPTION_TO_PHRASE_GROUNDING>",
+                phrase,
+            )
+            parsed = result.get("parsed", {})
+            grounding_data = parsed.get("<CAPTION_TO_PHRASE_GROUNDING>", {})
+            bboxes = grounding_data.get("bboxes", [])
+            labels = grounding_data.get("labels", [])
+
+            return {
+                "success": True,
+                "data": {
+                    "phrase": phrase,
+                    "count": len(bboxes),
+                    "bboxes": bboxes,
+                    "labels": labels,
+                    "device": result.get("device", "cpu"),
+                },
+                "message": f"Found {len(bboxes)} bounding box(es) for phrase '{phrase}'.",
+            }
+        except Exception as exc:
+            return {"success": False, "data": None, "message": f"Florence-2 grounding failed: {exc}"}
+
     # ------------------------------------------------------------------ #
     # Esquema para el LLM
     # ------------------------------------------------------------------ #
@@ -339,6 +514,23 @@ class VisionAbility(Ability):
                 "params": {
                     "prompt": "string (opcional) — pregunta o indicación de análisis visual.",
                     "image_path": "string (opcional) — ruta a imagen estática en lugar de cámara en vivo."
+                },
+            },
+            {
+                "action": "florence_analyze",
+                "description": "Executes Microsoft Florence-2 vision task (<DENSE_REGION_CAPTION>, <OCR_WITH_REGION>, <DETAILED_CAPTION>).",
+                "params": {
+                    "task_prompt": "string (optional, default '<DENSE_REGION_CAPTION>') - Florence-2 task tag.",
+                    "text_input": "string (optional) - additional prompt context.",
+                    "image_path": "string (optional) - path to static image file instead of live camera."
+                },
+            },
+            {
+                "action": "florence_grounding",
+                "description": "Locates target UI elements or visual phrases on screen/image and returns precise [x1, y1, x2, y2] bounding boxes.",
+                "params": {
+                    "phrase": "string (required) - target element description (e.g. 'submit button', 'red icon', 'login input').",
+                    "image_path": "string (optional) - path to static image file."
                 },
             },
         ]

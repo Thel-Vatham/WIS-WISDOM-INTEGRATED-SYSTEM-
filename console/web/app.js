@@ -43,6 +43,8 @@
   const stepNum = $("step-num");
   const stepMax = $("step-max");
   const approvalOverlay = $("approval-overlay");
+  const approvalBadge = $("approval-badge");
+  const approvalTitle = $("approval-title");
   const approvalDesc = $("approval-desc");
   const approvalDetail = $("approval-detail");
   const btnProceed = $("btn-proceed");
@@ -150,6 +152,40 @@
     // Inline code
     escaped = escaped.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
 
+    // Horizontal Rules (--- or ***)
+    escaped = escaped.replace(/^(?:---|___|\*\*\*)$/gm, '<hr class="console-hr">');
+
+    // Markdown Tables (| Header | Header |\n|---|---|...)
+    escaped = escaped.replace(/(?:^|\n)((?:\|[^\n]+\|\r?\n)+)/g, (match, tableBlock) => {
+      const rows = tableBlock.trim().split('\n').map(r => r.trim());
+      if (rows.length < 2) return match;
+      
+      const delimIndex = rows.findIndex(r => /^\|(?:\s*:?-+:?\s*\|)+$/.test(r));
+      if (delimIndex === -1) return match;
+
+      let tableHtml = '\n<div class="table-container"><table class="console-table"><thead><tr>';
+      
+      const headerCells = rows[0].split('|').slice(1, -1);
+      headerCells.forEach(cell => {
+        tableHtml += `<th>${cell.trim()}</th>`;
+      });
+      tableHtml += '</tr></thead><tbody>';
+
+      for (let i = 0; i < rows.length; i++) {
+        if (i === delimIndex || i === 0) continue;
+        const row = rows[i];
+        if (!row.startsWith('|')) continue;
+        const cells = row.split('|').slice(1, -1);
+        tableHtml += '<tr>';
+        cells.forEach(cell => {
+          tableHtml += `<td>${cell.trim()}</td>`;
+        });
+        tableHtml += '</tr>';
+      }
+      tableHtml += '</tbody></table></div>\n';
+      return tableHtml;
+    });
+
     // Headers
     escaped = escaped.replace(/^(#{1,6})\s+(.+)$/gm, (match, hashes, content) => {
       const level = hashes.length;
@@ -169,13 +205,20 @@
     escaped = escaped.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>');
     escaped = escaped.replace(/<\/ul>\s*<ul>/g, '\n');
 
-    // Convert remaining newlines to br, but avoid adding extra ones inside pre/ul/li blocks
+    // Convert remaining newlines to br, avoiding pre/table/ul/li/h/hr blocks
     const lines = escaped.split('\n');
     let inPre = false;
+    let inTable = false;
     const processedLines = lines.map(line => {
-      if (line.includes('<pre>')) inPre = true;
-      if (line.includes('</pre>')) inPre = false;
-      if (inPre || line.trim().startsWith('<ul') || line.trim().startsWith('</ul') || line.trim().startsWith('<li') || line.trim().startsWith('</li') || line.trim().startsWith('<h')) {
+      const trimmed = line.trim();
+      if (trimmed.includes('<pre>')) inPre = true;
+      if (trimmed.includes('</pre>')) inPre = false;
+      if (trimmed.includes('<table')) inTable = true;
+      if (trimmed.includes('</table>')) {
+        inTable = false;
+        return line;
+      }
+      if (inPre || inTable || trimmed.startsWith('<ul') || trimmed.startsWith('</ul') || trimmed.startsWith('<li') || trimmed.startsWith('</li') || trimmed.startsWith('<h') || trimmed.startsWith('<hr') || trimmed.startsWith('<div') || trimmed.startsWith('</div>')) {
         return line;
       }
       return line + '<br>';
@@ -299,15 +342,180 @@
     else typing.setAttribute("hidden", "true");
   }
 
+  // ----- Multimodal Attachment State & Handlers -----
+  let pendingAttachments = [];
+  const attachmentPreview = $("attachment-preview");
+  const attachBtn = $("attach-btn");
+  const fileInput = $("file-input");
+  const dropOverlay = $("drop-overlay");
+  const chatMain = $("chat-main");
+
+  function renderAttachmentsPreview() {
+    if (!attachmentPreview) return;
+    if (!pendingAttachments.length) {
+      attachmentPreview.setAttribute("hidden", "true");
+      attachmentPreview.innerHTML = "";
+      return;
+    }
+    attachmentPreview.removeAttribute("hidden");
+    attachmentPreview.innerHTML = pendingAttachments.map((att, idx) => {
+      const icon = att.is_image ? (att.previewUrl ? `<img class="thumb" src="${att.previewUrl}" />` : '🖼️') : '📄';
+      return `
+        <div class="attachment-chip">
+          <span>${icon}</span>
+          <span>${escapeHtml(att.filename)}</span>
+          <button class="btn-remove" data-idx="${idx}" title="Remove attachment">&times;</button>
+        </div>
+      `;
+    }).join("");
+
+    attachmentPreview.querySelectorAll(".btn-remove").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        const idx = parseInt(e.target.getAttribute("data-idx"), 10);
+        if (!isNaN(idx)) {
+          pendingAttachments.splice(idx, 1);
+          renderAttachmentsPreview();
+        }
+      });
+    });
+  }
+
+  async function uploadFile(file) {
+    if (!file) return;
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await authFetch(apiUrl("/api/upload"), {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) throw new Error("Upload HTTP error " + res.status);
+      const data = await res.json();
+      if (data.success) {
+        let previewUrl = "";
+        if (data.is_image && file instanceof Blob) {
+          previewUrl = URL.createObjectURL(file);
+        }
+        pendingAttachments.push({
+          path: data.path,
+          filename: data.filename,
+          is_image: data.is_image,
+          previewUrl: previewUrl,
+        });
+        renderAttachmentsPreview();
+      }
+    } catch (err) {
+      console.error("Error uploading file to WIS:", err);
+    }
+  }
+
+  // Ctrl+V (Paste) event listener
+  if (input) {
+    input.addEventListener("input", () => {
+      if (input.value && input.value.trim()) {
+        stopSpeech();
+      }
+    });
+    input.addEventListener("keydown", (e) => {
+      stopSpeech();
+    });
+    input.addEventListener("paste", (e) => {
+      stopSpeech();
+      const items = (e.clipboardData || (e.originalEvent && e.originalEvent.clipboardData))?.items;
+      if (!items) return;
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === "file") {
+          const blob = item.getAsFile();
+          if (blob) {
+            const filename = blob.name || `pasted_image_${Date.now()}.png`;
+            const file = new File([blob], filename, { type: blob.type });
+            uploadFile(file);
+          }
+        }
+      }
+    });
+  }
+
+  // Clip Button & hidden file input
+  if (attachBtn && fileInput) {
+    attachBtn.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", (e) => {
+      const files = e.target.files;
+      if (!files || !files.length) return;
+      for (let i = 0; i < files.length; i++) {
+        uploadFile(files[i]);
+      }
+      fileInput.value = "";
+    });
+  }
+
+  // Drag & Drop handlers
+  if (chatMain && dropOverlay) {
+    let dragCounter = 0;
+    window.addEventListener("dragenter", (e) => {
+      if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes("Files")) {
+        e.preventDefault();
+        dragCounter++;
+        dropOverlay.removeAttribute("hidden");
+      }
+    });
+    window.addEventListener("dragover", (e) => {
+      if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes("Files")) {
+        e.preventDefault();
+      }
+    });
+    window.addEventListener("dragleave", (e) => {
+      e.preventDefault();
+      dragCounter--;
+      if (dragCounter <= 0) {
+        dragCounter = 0;
+        dropOverlay.setAttribute("hidden", "true");
+      }
+    });
+    window.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dragCounter = 0;
+      dropOverlay.setAttribute("hidden", "true");
+      const files = e.dataTransfer ? e.dataTransfer.files : null;
+      if (files && files.length) {
+        for (let i = 0; i < files.length; i++) {
+          uploadFile(files[i]);
+        }
+      }
+    });
+  }
+
   function sendMessage(text) {
-    if (!text || !text.trim()) return;
+    stopSpeech();
+    const trimmed = (text || "").trim();
+    if (!trimmed && !pendingAttachments.length) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       addMessage("system", "Connection interrupted. Reconnecting...");
       connect();
       return;
     }
-    addMessage("user", text.trim());
-    ws.send(JSON.stringify({ type: "message", text: text.trim() }));
+
+    let messageText = trimmed;
+    if (pendingAttachments.length > 0) {
+      const attNotes = pendingAttachments.map(att => {
+        if (att.is_image) {
+          return `[Attached image: ${att.filename} -> absolute path: ${att.path}]`;
+        } else {
+          return `[Attached file: ${att.filename} -> absolute path: ${att.path}]`;
+        }
+      }).join("\n");
+
+      messageText = messageText ? `${messageText}\n\n${attNotes}` : attNotes;
+    }
+
+    addMessage("user", messageText);
+    ws.send(JSON.stringify({ type: "message", text: messageText }));
+    
+    pendingAttachments = [];
+    renderAttachmentsPreview();
+    
     setOrbState("thinking");
     setTyping(true);
   }
@@ -421,15 +629,72 @@
     }
   }
 
-  // ----- Control de Aprobación -----
-  function showApprovalOverlay(data) {
-    if (!approvalOverlay) return;
-    const name = data.name || "unknown";
-    const action = data.action || "unknown";
+  // ----- Control de Aprobación (Estilo Antigravity / IDE Moderno) -----
+  function parseApprovalData(data) {
+    const name = (data.name || "").toLowerCase();
+    const action = (data.action || "").toLowerCase();
     const params = data.params || {};
 
-    if (approvalDesc) approvalDesc.textContent = `Ability '${name}' requests execution of '${action}':`;
-    if (approvalDetail) approvalDetail.textContent = JSON.stringify(params, null, 2);
+    let badge = "⚡ TAREA";
+    let title = "Autorización Requerida";
+    let desc = "Esta acción requiere tu confirmación para proceder.";
+    let detail = "";
+    let isDanger = false;
+
+    if (name === "system" || action.includes("shell") || action.includes("cmd") || params.command) {
+      badge = "⚡ COMANDO SHELL";
+      title = "Ejecución de comando en consola";
+      desc = "El sistema solicita ejecutar el siguiente comando:";
+      detail = typeof params === "string" ? params : (params.command || JSON.stringify(params, null, 2));
+    } else if (action.includes("write") || action.includes("create") || action.includes("modify") || action.includes("file")) {
+      badge = "📝 ARCHIVO";
+      const pathStr = params.path || params.file || params.filename || "";
+      title = pathStr ? `Modificar archivo: ${pathStr}` : "Crear / Modificar archivo";
+      desc = "El agente requiere permisos para escribir en el sistema de archivos:";
+      detail = params.content || params.code || JSON.stringify(params, null, 2);
+    } else if (action.includes("delete") || action.includes("remove") || action.includes("unlink")) {
+      badge = "🗑️ ELIMINAR";
+      isDanger = true;
+      const pathStr = params.path || params.target || "";
+      title = pathStr ? `Eliminar: ${pathStr}` : "Eliminación de recurso";
+      desc = "Acción destructiva solicitada:";
+      detail = JSON.stringify(params, null, 2);
+    } else if (name === "browser" || action.includes("navigate") || action.includes("goto")) {
+      badge = "🌐 NAVEGADOR";
+      title = "Navegación Web";
+      desc = `Navegar a: ${params.url || params.target || action}`;
+      detail = JSON.stringify(params, null, 2);
+    } else if (name === "desktop" || action.includes("click") || action.includes("key")) {
+      badge = "🖥️ ESCRITORIO";
+      title = "Interacción con pantalla / escritorio";
+      desc = `Acción de interfaz: ${action}`;
+      detail = JSON.stringify(params, null, 2);
+    } else {
+      badge = `⚙️ ${(name || "SISTEMA").toUpperCase()}`;
+      title = `${action || "Acción restringida"}`;
+      desc = `Solicitud de la habilidad '${name}':`;
+      detail = typeof params === "string" ? params : (params.command || JSON.stringify(params, null, 2));
+    }
+
+    return { badge, title, desc, detail, isDanger };
+  }
+
+  function showApprovalOverlay(data) {
+    if (!approvalOverlay) return;
+    const parsed = parseApprovalData(data);
+
+    if (approvalBadge) {
+      approvalBadge.textContent = parsed.badge;
+      if (parsed.isDanger) {
+        approvalBadge.classList.add("approval-badge--danger");
+      } else {
+        approvalBadge.classList.remove("approval-badge--danger");
+      }
+    }
+    if (approvalTitle) approvalTitle.textContent = parsed.title;
+    if (approvalDesc) approvalDesc.textContent = parsed.desc;
+    if (approvalDetail) approvalDetail.textContent = parsed.detail;
+
     approvalOverlay.removeAttribute("hidden");
   }
 
@@ -543,6 +808,58 @@
     setTimeout(connect, delay);
   }
 
+  async function refreshGoals() {
+    const feed = $("goals-feed");
+    const badgeGoals = $("badge-goals");
+    if (!feed) return;
+
+    try {
+      const res = await authFetch(apiUrl("/api/goals"));
+      if (!res.ok) return;
+      const data = await res.json();
+      const goals = data.goals || [];
+
+      if (badgeGoals) badgeGoals.textContent = goals.length;
+
+      if (!goals.length) {
+        feed.innerHTML = '<span class="muted">No active goals. Register a goal to track live decomposition & execution.</span>';
+        return;
+      }
+
+      feed.innerHTML = goals.map(g => {
+        const prog = g.progress || { percent: 0, done: 0, total: 0 };
+        const subtasks = g.subtasks || [];
+        const statusEmoji = g.status === 'done' ? '✅' : (g.status === 'failed' ? '❌' : '⚙️');
+        
+        const subtasksHtml = subtasks.map(s => {
+          const icon = s.status === 'done' ? '✅' : (s.status === 'executing' ? '🔄' : (s.status === 'failed' ? '❌' : '⬜'));
+          return `<div class="subtask-row ${s.status}">
+            <span>${icon} Paso ${s.order_idx + 1}: ${escapeHtml(s.text)}</span>
+          </div>`;
+        }).join("");
+
+        return `
+          <div class="goal-card">
+            <div class="goal-header">
+              <span class="goal-title">${statusEmoji} ${escapeHtml(g.text)}</span>
+              <div class="goal-meta">
+                <span class="goal-status-badge">${g.status}</span>
+                <span>${prog.done}/${prog.total} (${prog.percent}%)</span>
+              </div>
+            </div>
+            <div class="goal-progress-bar">
+              <div class="goal-progress-fill" style="width: ${prog.percent}%"></div>
+            </div>
+            <div class="subtasks-list">
+              ${subtasksHtml}
+            </div>
+          </div>
+        `;
+      }).join("");
+
+    } catch (e) {}
+  }
+
   // ----- Estado y Logs -----
   async function refreshState() {
     try {
@@ -562,6 +879,8 @@
       if (statAbilities) statAbilities.textContent = active.length;
 
       const abs = (abRes && abRes.abilities) || [];
+      const badgeAbilities = $("badge-abilities");
+      if (badgeAbilities) badgeAbilities.textContent = abs.length;
       if (abilitiesList) {
         abilitiesList.innerHTML = abs.length
           ? abs.map((a) => `<li><b>${escapeHtml(a.name || a.skill || "")}</b> <small>(${escapeHtml(a.domain || "core")})</small></li>`).join("")
@@ -569,6 +888,8 @@
       }
 
       const facts = (factsRes && factsRes.facts) || [];
+      const badgeMemory = $("badge-memory");
+      if (badgeMemory) badgeMemory.textContent = facts.length;
       if (factsList) {
         factsList.innerHTML = facts.length
           ? facts.slice(-10).map((f) => `<li>${escapeHtml(f)}</li>`).join("")
@@ -586,6 +907,8 @@
       if (data.logs && Array.isArray(data.logs)) {
         logsPre.textContent = data.logs.join("\n");
         logsPre.scrollTop = logsPre.scrollHeight;
+        const badgeLogs = $("badge-logs");
+        if (badgeLogs) badgeLogs.textContent = data.logs.length;
       }
     } catch (e) {}
   }
@@ -648,6 +971,7 @@
     } catch (e) {}
   }
 
+  setInterval(refreshGoals, 2500);
   setInterval(refreshLogs, 3500);
   setInterval(refreshProactivity, 5000);
 
@@ -666,32 +990,79 @@
 
   function _pickEnglishVoice(voices) {
     if (!voices || voices.length === 0) return null;
-    // 1. Exact: Microsoft Zira Desktop - English (United States)
-    let v = voices.find(v => v.name === "Microsoft Zira Desktop - English (United States)");
+    const vList = Array.from(voices);
+
+    // 1. Online Natural Neural voices (Microsoft Jenny, Ava, Emma, Aria Online / Natural)
+    let v = vList.find(v => (v.name.toLowerCase().includes("natural") || v.name.toLowerCase().includes("online")) && v.lang.toLowerCase().startsWith("en"));
     if (v) return v;
-    // 2. Any Zira
-    v = voices.find(v => v.name.toLowerCase().includes("zira"));
+
+    // 2. Google Natural English Female
+    v = vList.find(v => v.name.toLowerCase().includes("google") && v.lang.toLowerCase().startsWith("en"));
     if (v) return v;
-    // 3. Any named English US female voice
-    const en_female = ["aria", "jenny", "eva", "samantha", "victoria", "karen", "catherine", "linda", "hazel"];
-    v = voices.find(v => v.lang.toLowerCase().startsWith("en") && en_female.some(k => v.name.toLowerCase().includes(k)));
+
+    // 3. Conversational & Soft Neural Female Voices (Jenny, Ava, Emma, Aria, Samantha)
+    const soft_voices = ["jenny", "ava", "emma", "aria", "samantha", "hazel", "eva", "victoria"];
+    v = vList.find(v => v.lang.toLowerCase().startsWith("en") && soft_voices.some(k => v.name.toLowerCase().includes(k)));
     if (v) return v;
-    // 4. Any English voice whatsoever
-    v = voices.find(v => v.lang.toLowerCase().startsWith("en-us") || v.lang.toLowerCase().startsWith("en-gb"));
+
+    // 4. Any English Female voice (avoiding robotic Zira if possible)
+    v = vList.find(v => v.lang.toLowerCase().startsWith("en") && !v.name.toLowerCase().includes("zira"));
     if (v) return v;
-    v = voices.find(v => v.lang.toLowerCase().startsWith("en"));
-    return v || null;
+
+    // 5. Any English Voice
+    v = vList.find(v => v.lang.toLowerCase().startsWith("en"));
+    return v || vList[0] || null;
+  }
+
+  function _cleanTextForSpeech(text) {
+    if (!text) return "";
+    let clean = String(text);
+
+    // 1. Remove code blocks
+    clean = clean.replace(/```[\s\S]*?```/g, " code block executed. ");
+
+    // 2. Format markdown tables
+    clean = clean.replace(/\|(?:\s*:?-+:?\s*\|)+/g, " ");
+    clean = clean.replace(/\|/g, ". ");
+
+    // 3. Remove all Emojis & Special Unicode Symbols
+    clean = clean.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{27BF}\u{1F900}-\u{1F9FF}\u{1F004}\u{1F0CF}\u{1F170}-\u{1F251}\u{2190}-\u{21FF}\u{2300}-\u{23FF}\u{2B50}\u{2B55}]/gu, "");
+
+    // 4. Clean Windows and Unix File Paths (e.g. C:\Users\..\Report.docx -> Report.docx)
+    clean = clean.replace(/[A-Za-z]:\\(?:[^\s\\]+\\)+([^\s\\]+)/g, "$1");
+    clean = clean.replace(/(?:\/[^\s\/]+)+\/([^\s\/]+)/g, "$1");
+
+    // 5. Replace backslashes (\) with spaces so TTS NEVER pronounces "backslash"
+    clean = clean.replace(/[\\]+/g, " ");
+    clean = clean.replace(/http[s]?:\/\/\S+/gi, "link");
+
+    // 6. Clean markdown symbols (*, #, _, ~, `, >, -)
+    clean = clean.replace(/^#{1,6}\s+/gm, "");
+    clean = clean.replace(/[*#_>~`|]/g, " ");
+    clean = clean.replace(/[{}[\]"']/g, " ");
+
+    // 7. Collapse whitespace
+    clean = clean.replace(/\s+/g, " ").trim();
+    return clean;
+  }
+
+  function stopSpeech() {
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    // Stop backend Kokoro audio if playing
+    stopSpeechBackend();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "interrupt", action: "stop_speech" }));
+      } catch (e) {}
+    }
   }
 
   function _speakNow(text) {
     try {
-      window.speechSynthesis.cancel();
-      let cleanText = text.replace(/```[\s\S]*?```/g, "Code executed.")
-                          .replace(/\|[\s\S]*?\|/g, " ")
-                          .replace(/[*#_>~`]/g, " ")
-                          .replace(/[{}[\]"']/g, " ")
-                          .replace(/\s+/g, " ")
-                          .trim();
+      stopSpeech();
+      let cleanText = _cleanTextForSpeech(text);
       if (!cleanText) return;
       if (cleanText.length > 3000) cleanText = cleanText.substring(0, 3000) + "...";
 
@@ -708,35 +1079,47 @@
     } catch (e) {}
   }
 
-  // ----- Voz TTS -----
-  function speakBack(text) {
-    if (!optTts || !optTts.checked || !("speechSynthesis" in window)) return;
-    if (!text) return;
+  // ----- Voz TTS (Kokoro ONNX Backend Exclusivo via /api/tts) -----
+  let _currentAudio = null;
 
-    if (_voicesReady) {
-      _speakNow(text);
-    } else {
-      // Voices not yet loaded — wait for them then speak
-      _doLoadVoices();
-      if (_voicesReady) {
-        _speakNow(text);
-      } else {
-        const originalHandler = window.speechSynthesis.onvoiceschanged;
-        window.speechSynthesis.onvoiceschanged = function() {
-          _doLoadVoices();
-          window.speechSynthesis.onvoiceschanged = originalHandler || null;
-          _speakNow(text);
-        };
-      }
+  function stopSpeechBackend() {
+    if (_currentAudio) {
+      _currentAudio.pause();
+      _currentAudio.src = "";
+      _currentAudio = null;
     }
   }
 
-  // Prime voice loading immediately so it is ready by first response
-  if ("speechSynthesis" in window) {
-    _doLoadVoices();
-    if (!_voicesReady && window.speechSynthesis.onvoiceschanged !== undefined) {
-      window.speechSynthesis.onvoiceschanged = _doLoadVoices;
-    }
+  function speakBack(text) {
+    if (!text || !text.trim()) return;
+    // Verificar si TTS está habilitado en el toggle
+    if (optTts && !optTts.checked) return;
+
+    // Cancelar audio previo
+    stopSpeechBackend();
+
+    authFetch(apiUrl("/api/tts"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text }),
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`TTS error ${res.status}`);
+        return res.blob();
+      })
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        _currentAudio = audio;
+        setOrbState("speaking");
+        audio.play().catch((e) => console.warn("Audio play failed:", e));
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
+          _currentAudio = null;
+          setOrbState("idle");
+        };
+      })
+      .catch((e) => console.warn("speakBack error:", e));
   }
 
   // ----- LÓGICA CONSOLA INFERIOR RESIZABLE & PESTAÑAS -----
@@ -875,6 +1258,7 @@
     recognition.lang = "en-US";
 
     recognition.onstart = () => {
+      stopSpeech();
       isListening = true;
       micBtn.classList.add("listening");
       setOrbState("listening");
@@ -920,6 +1304,7 @@
     // Fallback: usar el micrófono físico conectado al servidor backend (/api/listen)
     micBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
+      stopSpeech();
       micBtn.classList.add("listening");
       setOrbState("listening");
       if (input) input.placeholder = "Escuchando con el microfono del servidor...";

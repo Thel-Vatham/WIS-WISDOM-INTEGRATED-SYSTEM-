@@ -72,12 +72,28 @@ class ReasoningEngine:
         openai_tools: List[Dict[str, Any]] = self._tools_to_openai(tools) if tools else []
 
         raw_chunks: List[str] = []
-        async for chunk in self.llm_client.stream(
-            messages, tools=openai_tools or None, model=model
-        ):
-            raw_chunks.append(chunk)
-            # Stream each token chunk to the trace
-            event_bus.emit("reasoning.token_chunk", {"chunk": chunk})
+        try:
+            async for chunk in self.llm_client.stream(
+                messages, tools=openai_tools or None, model=model
+            ):
+                raw_chunks.append(chunk)
+                # Stream each token chunk to the trace
+                event_bus.emit("reasoning.token_chunk", {"chunk": chunk})
+        except Exception as e:
+            logger.warning(f"reasoning: API LLM failed ({e}). Falling back to LocalLLMClient.")
+            event_bus.emit("reasoning.token_chunk", {"chunk": "[Offline Mode] "})
+            
+            # Local fallback — usa un prompt COMPACTO (el system_prompt completo
+            # con las schemas de tools excede el contexto del modelo local).
+            if self.router.local_client:
+                local_prompt = self._build_local_fallback_prompt(user_input, sensor_data)
+                try:
+                    local_res = await self.router.local_client.generate(local_prompt, max_tokens=200)
+                    if local_res:
+                        raw_chunks.append(local_res)
+                        event_bus.emit("reasoning.token_chunk", {"chunk": local_res})
+                except Exception as local_e:
+                    logger.error(f"reasoning: Local LLM also failed: {local_e}")
 
         raw_response: str = "".join(raw_chunks)
         text, calls = self._split_text_and_calls(raw_response)
@@ -271,10 +287,11 @@ class ReasoningEngine:
             if ranked:
                 lines = []
                 for m in ranked:
+                    ts = m.get("created_at") or "recent"
                     ui = (m.get("user_input") or "")[:120]
                     resp = (m.get("response") or "")[:120]
-                    lines.append(f"- User: {ui} | Assistant: {resp}")
-                sections.append("Relevant memories:\n" + "\n".join(lines))
+                    lines.append(f"- [{ts}] User: {ui} | Assistant: {resp}")
+                sections.append("Relevant memories (ordered by timestamp and relevance):\n" + "\n".join(lines))
 
         facts_subject_hint = self._guess_subject_from_input(user_input)
         facts = self.memory.get_facts(subject=facts_subject_hint)
@@ -303,10 +320,10 @@ class ReasoningEngine:
         return None
 
     def _load_system_file(self, filename: str) -> str:
-        """Carga un archivo de sistema desde la carpeta Core/system si existe."""
+        """Carga un archivo de sistema desde config/system si existe."""
         from pathlib import Path
         try:
-            base_path = Path(__file__).resolve().parent.parent.parent / "Core" / "system"
+            base_path = Path(__file__).resolve().parent.parent / "config" / "system"
             file_path = base_path / filename
             if file_path.exists():
                 return file_path.read_text(encoding="utf-8")
@@ -423,6 +440,31 @@ class ReasoningEngine:
             "you MUST output your text strictly in English (e.g. explain or translate into English)."
         )
 
+        # 9. No Unrequested System Metrics Rule
+        parts.append(
+            "NO UNREQUESTED SYSTEM METRICS RULE\n"
+            "Never report or dump system metrics (such as CPU %, RAM %, Disk %, process counts, or hardware usage) "
+            "unless the user explicitly asks for system stats, performance, or hardware status. "
+            "Focus directly and concisely on answering the user's task or question."
+        )
+
+        # 10. ANTI-HALLUCINATION AND TRUTHFULNESS (MANDATORY — highest priority)
+        parts.append(
+            "ANTI-HALLUCINATION AND TRUTHFULNESS RULE (MANDATORY — HIGHEST PRIORITY)\n"
+            "You are an agent that executes real actions in the real world. Honesty about outcomes is critical.\n\n"
+            "RULES:\n"
+            "1. ONLY report outcomes that are CONFIRMED by actual tool results returned to you in the execution trace.\n"
+            "2. If a tool returned success=True → report success for THAT specific action only — do NOT extrapolate.\n"
+            "3. If a tool returned success=False, error, or no result → report the failure HONESTLY. Never hide errors.\n"
+            "4. NEVER claim a file exists unless a tool confirmed its path. NEVER claim a process is running unless a tool returned a PID or confirmation.\n"
+            "5. NEVER invent file paths, PIDs, screenshots, waveforms, or results not explicitly present in the tool output.\n"
+            "6. If you did NOT use a tool to do something, do NOT claim you did it.\n"
+            "7. Use precise language: say 'The tool reported...' or 'I attempted to...' rather than asserting facts you cannot verify.\n"
+            "8. If uncertain whether something worked, say so explicitly: 'I cannot confirm whether X succeeded without visual verification.'\n"
+            "9. NEVER fabricate ✅ checkmarks or success tables for actions whose tool results are not in the trace.\n"
+            "10. A claimed action with no tool call in the trace = hallucination. This is FORBIDDEN."
+        )
+
         return "\n\n".join(parts)
 
     @staticmethod
@@ -434,6 +476,54 @@ class ReasoningEngine:
             return f"{text}\n\n[Sensory Data: {sensors_str}]"
         except Exception:
             return text
+
+    def _build_local_fallback_prompt(
+        self,
+        user_input: str,
+        sensor_data: Optional[Dict[str, Any]],
+        max_history_turns: int = 4,
+    ) -> str:
+        """Construye un prompt COMPACTO para el LLM local (TinyLlama, ctx ~2048).
+
+        El system_prompt normal incluye las schemas completas de tools, que
+        solas suman miles de tokens y desbordan el contexto del modelo local
+        (causando 'Number of tokens exceeded maximum context length'). Aqui se
+        resume lo esencial: identidad, reglas, un minimo de historial y la
+        pregunta del usuario.
+        """
+        import datetime
+        now = datetime.datetime.now()
+        now_str = now.strftime("%A, %B %d, %Y, %H:%M:%S")
+
+        name = self.identity.get_name()
+        desc = self.identity.get_description() or "AI assistant"
+
+        parts = [
+            f"You are {name}. {desc}",
+            f"Current date/time: {now_str}",
+            "Rules:",
+            "- Respond in clear, natural English, regardless of the user's language.",
+            "- Be direct, concise, helpful, and honest.",
+            "- Never invent facts, file paths, or system states you cannot verify.",
+        ]
+
+        # Últimas N vueltas de historial (no todo, para no desbordar).
+        history = self.memory.get_history()
+        if history:
+            recent = history[-max_history_turns * 2:]  # user+assistant por turno
+            hist_lines = []
+            for msg in recent:
+                role = msg.get("role", "")
+                content = (msg.get("content") or "")[:200]
+                if role == "user":
+                    hist_lines.append(f"User: {content}")
+                elif role == "assistant":
+                    hist_lines.append(f"Assistant: {content}")
+            if hist_lines:
+                parts.append("Recent conversation:\n" + "\n".join(hist_lines[-6:]))
+
+        user_msg = self._format_user_message(user_input, sensor_data)
+        return "\n".join(parts) + f"\n\nUser: {user_msg}\nAssistant: "
 
     def _parse_dsml_calls(self, content: str) -> List[Dict[str, Any]]:
         """Parsea llamadas de herramientas formateadas con la sintaxis DSML de Avrora."""

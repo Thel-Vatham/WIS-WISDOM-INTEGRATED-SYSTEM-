@@ -10,6 +10,7 @@ import os
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 try:
@@ -191,19 +192,146 @@ class LLMClient:
                 await asyncio.sleep(self.backoffs[min(attempt - 1, len(self.backoffs) - 1)])
 
 
+class LocalLLMClient:
+    """Cliente para inferencia local en CPU con modelo TinyLlama-1.1B GGUF.
+    Descarga automáticamente el modelo en la carpeta models/ si no existe.
+    """
+
+    def __init__(
+        self,
+        model_filename: str = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        context_length: int = 2048,
+    ) -> None:
+        self.models_dir = Path("models")
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.model_path = self.models_dir / model_filename
+        self.download_url = "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+        self._model = None
+        # Contexto del modelo local (TinyLlama soporta hasta 2048).
+        self._context_length: int = max(512, int(context_length))
+
+    def ensure_model(self) -> bool:
+        """Descarga el modelo GGUF automáticamente en la carpeta models/ si no existe o está incompleto."""
+        if self.model_path.exists():
+            if self.model_path.stat().st_size < 600 * 1024 * 1024:
+                logger.warning("Local GGUF model is incomplete or corrupted (size < 600MB). Deleting...")
+                try:
+                    self.model_path.unlink()
+                except Exception as e:
+                    logger.error("Failed to delete corrupted model: %s", e)
+                    return False
+            else:
+                return True
+        import urllib.request
+        try:
+            logger.info("Downloading local CPU model TinyLlama-1.1B (~630MB) to %s...", self.model_path)
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            req = urllib.request.Request(self.download_url, headers=headers)
+            with urllib.request.urlopen(req) as resp, open(self.model_path, "wb") as f:
+                chunk_size = 1024 * 1024
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            logger.info("Local GGUF model downloaded successfully.")
+            return True
+        except Exception as exc:
+            logger.error("Failed to download local GGUF model: %s", exc)
+            if self.model_path.exists():
+                try:
+                    self.model_path.unlink()
+                except Exception:
+                    pass
+            return False
+
+    def load_model(self):
+        if self._model is not None:
+            return self._model
+        if not self.ensure_model():
+            return None
+        try:
+            from ctransformers import AutoModelForCausalLM
+            self._model = AutoModelForCausalLM.from_pretrained(
+                str(self.model_path),
+                model_type="llama",
+                context_length=self._context_length,
+            )
+            logger.info("Local CPU LLM TinyLlama-1.1B loaded successfully (context=%d).", self._context_length)
+            return self._model
+        except Exception as exc:
+            logger.error("Error loading local CPU model: %s", exc)
+            return None
+
+    @staticmethod
+    def _truncate_prompt(prompt: str, max_input_tokens: int) -> str:
+        """Trunca el prompt para que quepa en el contexto del modelo.
+
+        Usa una estimacion CONSERVADORA de ~2 caracteres por token. El texto
+        real (espanol/ingles con markdown y emojis) tokeniza a ~2.5-3
+        chars/token, asi que este factor garantiza que el prompt truncado
+        NUNCA exceda el contexto del modelo. Excederlo provoca un abort nativo
+        de ctransformers ('exceeded maximum context length') que mata el
+        proceso entero de WIS sin traceback.
+        Se conserva el FINAL del prompt (instrucciones + pregunta del usuario),
+        que es lo esencial para generar una respuesta util.
+        """
+        prefix = "...[truncated context]...\n"
+        max_chars = max(128, int(max_input_tokens) * 2)
+        if len(prompt) <= max_chars:
+            return prompt
+        # Descuenta el prefijo del presupuesto para que el total final
+        # (prefijo + cuerpo) nunca supere max_chars.
+        body = prompt[-(max_chars - len(prefix)):]
+        return prefix + body
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Estimacion conservadora: a lo sumo 2 caracteres por token.
+
+        Es un LIMITE SUPERIOR (los tokens reales de texto mixto ocupan
+        ~2.5-3 chars), por lo que si len/2 cabe, los tokens reales tambien.
+        """
+        return len(text) // 2
+
+    async def generate(self, prompt: str, max_tokens: int = 150) -> str:
+        model = await asyncio.to_thread(self.load_model)
+        if not model:
+            return ""
+        # Contexto real del modelo (ctransformers lo expone tras cargarlo).
+        ctx = getattr(model, "context_length", None) or self._context_length
+        # Margen de 32 tokens para el prompt + generacion, nunca a tope.
+        max_input = max(64, int(ctx) - int(max_tokens) - 32)
+        safe_prompt = self._truncate_prompt(prompt, max_input)
+        # Defensa en profundidad: si la estimacion realista aun excede, corta
+        # de nuevo. Un abort nativo de ctransformers NO se puede capturar con
+        # try/except, por lo que la prevencion es la unica proteccion.
+        while self._estimate_tokens(safe_prompt) > max_input:
+            safe_prompt = self._truncate_prompt(safe_prompt, max_input // 2)
+        try:
+            res = await asyncio.to_thread(model, safe_prompt, max_new_tokens=max_tokens)
+        except Exception as exc:
+            logger.error("Local LLM generation failed: %s", exc)
+            return ""
+        return str(res or "").strip()
+
+
 class ModelRouter:
-    """Enruta entre un modelo rapido y uno fuerte."""
+    """Enruta entre un modelo rapido (local o cloud) y uno fuerte."""
 
     def __init__(
         self,
         fast_model: str = "deepseek-chat",
         strong_model: str = "deepseek-chat",
+        local_client: Optional[LocalLLMClient] = None,
     ) -> None:
         self.fast_model: str = fast_model
         self.strong_model: str = strong_model
+        self.local_client: Optional[LocalLLMClient] = local_client or LocalLLMClient()
 
     def route(self, user_input: str, has_tools: bool = False) -> str:
         text = (user_input or "").strip()
         if len(text) > 300 or has_tools:
             return self.strong_model
         return self.fast_model
+

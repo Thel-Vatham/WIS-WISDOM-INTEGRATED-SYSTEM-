@@ -1,13 +1,8 @@
 """
-WIS Voice Ability - Text-to-speech con voces neuronales naturales.
+WIS Voice Ability — Kokoro-82M ONNX Engine (Voz Exclusiva: af_sky).
 ===================================================================
-Motor primario: edge-tts (Microsoft Edge Neural TTS) — voces premium
-naturales, gratis, sin API key, requiere internet.
-Fallback: pyttsx3 (offline) — cuando no hay conexion.
-
-Deteccion automatica de idioma: si el texto es espanol, usa voz femenina
-espanola automaticamente (es-ES-ElviraNeural). Si es ingles, usa en-US-
-AriaNeural (femenina natural).
+Utiliza únicamente el modelo neuronal Kokoro-82M ONNX con la voz 'af_sky'.
+Todos los motores legacy robóticos (pyttsx3 / edge-tts) han sido eliminados.
 """
 from __future__ import annotations
 
@@ -15,75 +10,49 @@ import asyncio
 import logging
 import re
 import tempfile
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import soundfile as sf
 
 from .base import Ability
 
 logger = logging.getLogger("wis.abilities.voice")
 
-# ──────────────────────────────────────────────────────────────────────────
-# Voces neuronales por idioma (edge-tts)
-# ──────────────────────────────────────────────────────────────────────────
-
-# Mapa: idioma → (voz_predeterminada, voces_alternativas)
-_NEURAL_VOICES: Dict[str, Dict[str, Any]] = {
-    "es": {
-        "default": "es-ES-ElviraNeural",        # Femenina, Espana
-        "alternatives": [
-            "es-MX-DalianNeural",                # Femenina, Mexico
-            "es-AR-ElenaNeural",                 # Femenina, Argentina
-            "es-CO-SalomeNeural",                # Femenina, Colombia
-            "es-US-PalomaNeural",                # Femenina, EE.UU.
-        ],
-    },
-    "en": {
-        "default": "en-US-AriaNeural",          # Femenina, natural
-        "alternatives": [
-            "en-US-JennyNeural",                 # Femenina, conversacional
-            "en-GB-SoniaNeural",                 # Femenina, UK
-            "en-US-AnaNeural",                   # Femenina, nina
-            "en-AU-NatashaNeural",               # Femenina, Australia
-        ],
-    },
-}
-
-# Palabras comunes en espanol para deteccion de idioma.
-_SPANISH_INDICATORS = frozenset((
-    "que", "hola", "como", "esta", "buenos", "buenas", "gracias", "por",
-    "favor", "pero", "porque", "cuando", "donde", "quien", "cual", "cuanto",
-    "muy", "mucho", "poco", "todo", "nada", "algo", "alguien", "tambien",
-    "ahora", "despues", "antes", "aqui", "alli", "entonces", "pues",
-    "del", "al", "para", "nuestro", "esto", "eso",
-    "recuerdame", "dime", "habla", "escucha", "abre", "cierra", "busca",
-    "hora", "tiempo", "dia", "hoy", "manana", "ayer", "noche", "tarde",
-    "planta", "plantas", "regar", "agua", "calendario", "recordatorio",
-))
-
-# Caracteres especificos del espanol.
-_SPANISH_CHARS = frozenset("áéíóúñü¿¡")
+DEFAULT_KOKORO_VOICE = "af_sky"
 
 
-def _detect_language(text: str) -> str:
-    """Always returns 'en' to maintain native English voice output."""
-    return "en"
+import unicodedata
 
-
-# Single native English female neural voice for the entire system
-DEFAULT_VOICE = "en-US-AriaNeural"
-
-
-def _get_neural_voice(language: str = "en") -> str:
-    """Returns the single native English neural voice to maintain consistency."""
-    return DEFAULT_VOICE
+def _clean_text_for_speech(text: str) -> str:
+    """Limpia el texto antes de enviarlo a Kokoro para una síntesis natural sin lectura de símbolos ni rutas."""
+    if not text:
+        return ""
+    # Convertir diacríticos y acentos a ASCII limpio (ej. Nicolás -> Nicolas) para fonetización perfecta en Kokoro
+    clean = unicodedata.normalize('NFKD', str(text)).encode('ascii', 'ignore').decode('utf-8')
+    # 1. Eliminar bloques de código
+    clean = re.sub(r'```[\s\S]*?```', ' code block executed. ', clean)
+    # 2. Formatear tablas markdown
+    clean = re.sub(r'\|(?:\s*:?-+:?\s*\|)+', ' ', clean)
+    clean = clean.replace('|', '. ')
+    # 3. Limpiar rutas de archivos de Windows y Unix (ej. C:\Users\..\Report.docx -> Report.docx)
+    clean = re.sub(r'[A-Za-z]:\\(?:[^\s\\]+\\)+([^\s\\]+)', r'\1', clean)
+    clean = re.sub(r'(?:/[^\s/]+)+/([^\s/]+)', r'\1', clean)
+    # 4. Reemplazar contrabarras (\) para que NUNCA pronuncie "backslash"
+    clean = clean.replace('\\', ' ')
+    clean = re.sub(r'https?://\S+', 'link', clean)
+    # 5. Eliminar símbolos de formato markdown y puntuaciones raras (#, *, _, ~, `, ?, !)
+    clean = re.sub(r'^#{1,6}\s+', '', clean, flags=re.MULTILINE)
+    clean = re.sub(r'[*#_>~`]', ' ', clean)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean
 
 
 class VoiceAbility(Ability):
     """
-    Habilidad de voz con voces neuronales naturales.
-
-    Motor primario: edge-tts (Microsoft Neural TTS online).
-    Fallback: pyttsx3 (offline, calidad reducida).
+    Habilidad de Voz Neural de WIS — Kokoro-82M ONNX (Voz Exclusiva: af_sky).
+    Sin motores robóticos de fallback ni pyttsx3/edge-tts.
     """
 
     def __init__(
@@ -94,379 +63,192 @@ class VoiceAbility(Ability):
         voice_override: Optional[str] = None,
     ) -> None:
         self._rate = rate
-        self._language = "en"
         self._enabled = enabled
-        self._voice_override = voice_override or DEFAULT_VOICE
-        self._pyttsx_engine = None  # Motor fallback (lazy init)
+        self._voice = DEFAULT_KOKORO_VOICE
+        self._kokoro_engine = None
 
-    # ------------------------------------------------------------------ #
-    # Metadatos
-    # ------------------------------------------------------------------ #
     @property
     def name(self) -> str:
         return "voice"
 
     @property
     def description(self) -> str:
-        return "Natural text-to-speech output using native English neural voices (edge-tts / Zira fallback)."
+        return "Natural neural text-to-speech engine using Kokoro-82M ONNX with 'af_sky' voice."
 
     @property
     def domain(self) -> str:
         return "voice"
 
-    # ------------------------------------------------------------------ #
-    # Motor edge-tts (primario)
-    # ------------------------------------------------------------------ #
+    def _ensure_kokoro_engine(self):
+        if self._kokoro_engine is not None:
+            return self._kokoro_engine
 
-    async def _speak_edge_tts(self, text: str, voice: str) -> bool:
-        """Sintetiza y reproduce audio con edge-tts. Devuelve True si ok."""
         try:
-            import edge_tts
-        except ImportError:
-            logger.debug("edge-tts no disponible, usando fallback.")
-            return False
+            from kokoro_onnx import Kokoro
+            models_dir = Path("Data/kokoro")
+            models_dir.mkdir(parents=True, exist_ok=True)
 
-        tmp_path: Optional[Path] = None
-        try:
-            rate_pct = int((self._rate - 170) / 170 * 100)
-            rate_str = f"{rate_pct:+d}%"
+            model_path = models_dir / "kokoro-v0_19.onnx"
+            voices_path = models_dir / "voices.bin"
 
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=voice,
-                rate=rate_str,
-            )
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
-            tmp_dir = Path(tempfile.gettempdir()) / "wis_tts"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = tmp_dir / f"tts_{hash(text) & 0xFFFFFFFF}.mp3"
+            if not model_path.exists():
+                logger.info("Downloading Kokoro-82M ONNX model to Data/kokoro...")
+                req = urllib.request.Request("https://huggingface.co/thewh1teagle/Kokoro/resolve/main/kokoro-v0_19.onnx", headers=headers)
+                with urllib.request.urlopen(req) as resp, open(model_path, "wb") as f:
+                    f.write(resp.read())
 
-            await communicate.save(str(tmp_path))
+            if not voices_path.exists():
+                logger.info("Downloading Kokoro voices.bin to Data/kokoro...")
+                req = urllib.request.Request("https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin", headers=headers)
+                with urllib.request.urlopen(req) as resp, open(voices_path, "wb") as f:
+                    f.write(resp.read())
 
-            await asyncio.to_thread(self._play_audio, tmp_path)
-            return True
+            self._kokoro_engine = Kokoro(str(model_path), str(voices_path))
+            logger.info("Kokoro-82M ONNX Engine initialized successfully with voice 'af_sky'.")
+            return self._kokoro_engine
 
         except Exception as exc:
-            logger.warning(f"edge-tts fallo: {exc}")
-            return False
-        finally:
-            if tmp_path and tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except Exception:
-                    pass
+            logger.error("Failed to initialize Kokoro ONNX engine: %s", exc)
+            return None
 
-    def _play_audio(self, audio_path: Path) -> None:
-        """Reproduce un archivo de audio usando el reproductor del OS."""
-        import subprocess
-        import sys
-
-        path_str = str(audio_path)
-        if sys.platform == "win32":
-            try:
-                subprocess.Popen(
-                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path_str],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                ).wait()
-            except (FileNotFoundError, OSError):
-                import os
-                os.startfile(path_str)  # type: ignore[attr-defined]
-                import time
-                time.sleep(0.5)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["afplay", path_str]).wait()
-        else:
-            try:
-                subprocess.Popen(
-                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path_str],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                ).wait()
-            except (FileNotFoundError, OSError):
-                subprocess.Popen(["aplay", path_str]).wait()
-
-    # ------------------------------------------------------------------ #
-    # Motor pyttsx3 (fallback offline)
-    # ------------------------------------------------------------------ #
-
-    def _init_fallback_engine(self) -> bool:
-        """Inicializa pyttsx3 como fallback. Devuelve True si ok."""
-        if not self._enabled:
-            return False
-        if self._pyttsx_engine is not None:
-            return True
-        try:
-            import pyttsx3
-
-            self._pyttsx_engine = pyttsx3.init()
-            self._pyttsx_engine.setProperty("rate", self._rate)
-            self._select_fallback_voice("en")
-            return True
-        except Exception:
-            self._pyttsx_engine = None
-            return False
-
-    def _select_fallback_voice(self, language: str = "en") -> None:
-        """Selecciona estrictamente una voz nativa en ingles para pyttsx3."""
-        try:
-            voices = self._pyttsx_engine.getProperty("voices")
-            if not voices:
-                return
-
-            female_keywords_en = ("zira", "aria", "jenny", "eva", "hazel", "samantha", "victoria", "karen", "catherine", "linda", "female")
-
-            target_voice = None
-            # 1. English female voice (e.g. Zira, Jenny, Hazel)
-            for v in voices:
-                v_name = str(getattr(v, "name", "")).lower()
-                v_id = str(getattr(v, "id", "")).lower()
-                v_langs = str(getattr(v, "languages", "")).lower()
-
-                is_english = "en-us" in v_id or "en_us" in v_id or "en-gb" in v_id or "english" in v_name or "en-" in v_name or "en-us" in v_langs or "zira" in v_name or "hazel" in v_name
-                if is_english and any(k in v_name for k in female_keywords_en):
-                    target_voice = v
-                    break
-
-            # 2. Any English voice (e.g. David, English US/UK)
-            if not target_voice:
-                for v in voices:
-                    v_name = str(getattr(v, "name", "")).lower()
-                    v_id = str(getattr(v, "id", "")).lower()
-                    v_langs = str(getattr(v, "languages", "")).lower()
-
-                    if "en-us" in v_id or "en_us" in v_id or "english" in v_name or "zira" in v_name or "david" in v_name or "en-" in v_name or "en-us" in v_langs:
-                        target_voice = v
-                        break
-
-            if not target_voice:
-                target_voice = voices[0]
-
-            self._pyttsx_engine.setProperty("voice", target_voice.id)
-
-            # Direct SAPI5 COM object driver update for Windows stability
-            try:
-                drv = getattr(getattr(self._pyttsx_engine, "proxy", None), "_driver", None)
-                if drv and hasattr(drv, "_tts") and hasattr(drv, "_tokenFromId"):
-                    token = drv._tokenFromId(target_voice.id)
-                    if token:
-                        drv._tts.Voice = token
-            except Exception:
-                pass
-
-            logger.info(f"Fallback TTS voice selected: {target_voice.name}")
-        except Exception as exc:
-            logger.warning(f"Error selecting fallback voice: {exc}")
-
-    # ------------------------------------------------------------------ #
-    # Ejecucion de acciones
-    # ------------------------------------------------------------------ #
-
-    async def execute(self, action: str, params: dict) -> dict:
-        action = (action or "").lower().strip()
-
-        if action == "speak":
-            return await self._speak(params)
-        if action == "set_voice":
-            return self._set_voice(params)
-        if action == "set_rate":
-            return self._set_rate(params)
-        if action == "list_voices":
-            return self._list_voices()
-        if action == "mute":
-            self._enabled = False
-            return {
-                "success": True,
-                "data": {"enabled": False},
-                "message": "Voz silenciada. WIS ya no hablara en voz alta a menos que se use la accion 'unmute'.",
-            }
-        if action == "unmute":
-            self._enabled = True
-            return {
-                "success": True,
-                "data": {"enabled": True},
-                "message": "Voz activada. WIS hablara en voz alta cuando sea necesario.",
-            }
-
-        return {
-            "success": False,
-            "data": None,
-            "message": f"Accion de voz no reconocida: '{action}'.",
-        }
-
-    async def _speak(self, params: dict) -> dict:
-        """Sintetiza voz: intenta edge-tts primero, fallback a pyttsx3."""
-        text = str(params.get("text", "")).strip()
-        if not text:
-            return {"success": False, "data": None, "message": "Texto vacio."}
-        if not self._enabled:
-            return {
-                "success": False,
-                "data": None,
-                "message": "Voz deshabilitada en la configuracion.",
-            }
-
-        # Usar la voz femenina unica del sistema (sin cambiar dinamicamente)
-        voice = self._voice_override or DEFAULT_VOICE
-        lang = "en"
-
-        # Intentar edge-tts (motor primario).
-        spoken = await self._speak_edge_tts(text, voice)
-        if spoken:
-            return {
-                "success": True,
-                "data": {
-                    "text": text,
-                    "engine": "edge-tts",
-                    "voice": voice,
-                    "language": lang,
-                    "rate": self._rate,
-                },
-                "message": "Text spoken using neural voice.",
-            }
-
-        # Fallback: pyttsx3 offline.
-        if self._init_fallback_engine():
-            try:
-                self._select_fallback_voice(lang)
-                await asyncio.to_thread(self._pyttsx_engine.say, text)
-                await asyncio.to_thread(self._pyttsx_engine.runAndWait)
-                return {
-                    "success": True,
-                    "data": {
-                        "text": text,
-                        "engine": "pyttsx3",
-                        "language": lang,
-                        "rate": self._rate,
-                    },
-                    "message": "Text spoken (offline voice).",
-                }
-            except Exception as exc:
-                return {"success": False, "data": None, "message": f"TTS Error: {exc}"}
-
-        return {
-            "success": False,
-            "data": None,
-            "message": "No TTS engine available (install edge-tts or pyttsx3).",
-        }
-
-    def _set_voice(self, params: dict) -> dict:
-        """Cambia la voz. Acepta nombres edge-tts o ids pyttsx3."""
-        voice_id = params.get("id") or params.get("name")
-        if not voice_id:
-            # Si no se especifica, mostrar las opciones conocidas.
-            return {
-                "success": False,
-                "data": None,
-                "message": (
-                    "Especifica 'name'. Voces disponibles: "
-                    + ", ".join(
-                        str(v["default"]) for v in _NEURAL_VOICES.values()
-                    )
-                ),
-            }
-
-        voice_name = str(voice_id).strip()
-
-        # Si parece una voz edge-tts (contiene 'Neural'), guardarla.
-        if "neural" in voice_name.lower():
-            self._voice_override = voice_name
-            return {
-                "success": True,
-                "data": {"voice": voice_name, "engine": "edge-tts"},
-                "message": f"Voz neuronal seleccionada: {voice_name}",
-            }
-
-        # Si no, intentar como voz pyttsx3.
-        if self._init_fallback_engine():
-            try:
-                voices = self._pyttsx_engine.getProperty("voices")
-                for v in voices:
-                    if voice_name.lower() in str(getattr(v, "name", "")).lower() or voice_name == getattr(v, "id", ""):
-                        self._pyttsx_engine.setProperty("voice", v.id)
-                        return {
-                            "success": True,
-                            "data": {"voice": v.id, "engine": "pyttsx3"},
-                            "message": "Voz actualizada.",
-                        }
-            except Exception:
-                pass
-
-        return {"success": False, "data": None, "message": "Voz no encontrada."}
-
-    def _set_rate(self, params: dict) -> dict:
-        try:
-            rate = int(params.get("rate", self._rate))
-        except (TypeError, ValueError):
-            return {"success": False, "data": None, "message": "Rate debe ser un entero."}
-        self._rate = max(50, min(400, rate))
-        if self._pyttsx_engine:
-            self._pyttsx_engine.setProperty("rate", self._rate)
-        return {
-            "success": True,
-            "data": {"rate": self._rate},
-            "message": f"Velocidad = {self._rate} wpm.",
-        }
-
-    def _list_voices(self) -> dict:
-        """Lista voces neuronales disponibles + voces offline del sistema."""
-        neural: List[Dict[str, str]] = []
-        for lang_key, voices in _NEURAL_VOICES.items():
-            neural.append({"voice": str(voices["default"]), "language": lang_key, "type": "neural"})
-            for alt in voices.get("alternatives", []):
-                neural.append({"voice": str(alt), "language": lang_key, "type": "neural"})
-
-        offline: List[Dict[str, str]] = []
-        if self._init_fallback_engine():
-            try:
-                for v in self._pyttsx_engine.getProperty("voices"):
-                    offline.append({
-                        "id": str(getattr(v, "id", "")),
-                        "name": str(getattr(v, "name", "")),
-                        "type": "offline",
-                    })
-            except Exception:
-                pass
-
-        return {
-            "success": True,
-            "data": neural + offline,
-            "message": f"{len(neural)} voces neuronales + {len(offline)} offline.",
-        }
-
-    # ------------------------------------------------------------------ #
-    # Esquema para el LLM
-    # ------------------------------------------------------------------ #
-    def get_schema(self) -> list:
+    def get_schema(self) -> List[Dict[str, Any]]:
         return [
             {
                 "action": "speak",
-                "description": "Speak the given text aloud using natural neural voices. Language is auto-detected.",
-                "params": {"text": "string (required) - text to synthesize"},
+                "description": "Speak text out loud using natural Kokoro 'af_sky' neural voice.",
+                "params": {"text": "Text to synthesize into spoken audio"},
             },
             {
-                "action": "set_voice",
-                "description": "Change the active TTS voice. Use neural voice names like 'es-ES-ElviraNeural' or 'en-US-AriaNeural'.",
-                "params": {"name": "string (optional) - neural voice name"},
-            },
-            {
-                "action": "set_rate",
-                "description": "Set speech rate in words per minute (typical 100-250, default 170).",
-                "params": {"rate": "int"},
-            },
-            {
-                "action": "list_voices",
-                "description": "List available neural and offline TTS voices.",
-                "params": {},
+                "action": "synthesize",
+                "description": "Synthesize text to WAV bytes (returns base64 wav data, does NOT play audio — for streaming to browser).",
+                "params": {"text": "Text to synthesize"},
             },
             {
                 "action": "mute",
-                "description": "Silence the voice output completely. WIS will execute actions but not speak aloud.",
+                "description": "Mute voice output.",
                 "params": {},
             },
             {
                 "action": "unmute",
-                "description": "Re-enable voice output. WIS will speak aloud normally.",
+                "description": "Unmute voice output.",
                 "params": {},
             },
         ]
+
+    async def execute(self, action: str, params: dict) -> dict:
+        action = (action or "").lower().strip()
+        if action == "speak":
+            return await self._speak(params)
+        if action == "synthesize":
+            return await self._synthesize_only(params)
+        if action == "mute":
+            self._enabled = False
+            return {"success": True, "message": "Voice muted."}
+        if action == "unmute":
+            self._enabled = True
+            return {"success": True, "message": "Voice unmuted."}
+        return {"success": False, "message": f"Unknown action: '{action}'."}
+
+    async def _speak(self, params: dict) -> dict:
+        if not self._enabled:
+            return {"success": False, "message": "Voice is muted."}
+        raw_text = str(params.get("text", "")).strip()
+        if not raw_text:
+            return {"success": False, "message": "Empty text."}
+
+        clean_text = _clean_text_for_speech(raw_text)
+        if not clean_text:
+            return {"success": False, "message": "No speakable text after cleaning."}
+
+        try:
+            engine = await asyncio.to_thread(self._ensure_kokoro_engine)
+            if not engine:
+                return {"success": False, "message": "Kokoro ONNX engine unavailable."}
+
+            samples, sample_rate = await asyncio.to_thread(
+                engine.create, clean_text, voice=self._voice, speed=1.0, lang="en-us"
+            )
+
+            tmp_dir = Path(tempfile.gettempdir()) / "wis_kokoro"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = tmp_dir / f"sky_{hash(clean_text) & 0xFFFFFFFF}.wav"
+
+            await asyncio.to_thread(sf.write, str(tmp_path), samples, sample_rate)
+            await asyncio.to_thread(self._play_audio, tmp_path)
+
+            return {
+                "success": True,
+                "data": {
+                    "text": clean_text,
+                    "voice": "af_sky",
+                    "engine": "kokoro-82m-onnx",
+                },
+                "message": f"Spoken with Kokoro-82M ONNX (voice: af_sky): '{clean_text[:60]}...'",
+            }
+        except Exception as exc:
+            logger.exception("Error in Kokoro synthesis: %s", exc)
+            return {"success": False, "message": f"Kokoro TTS error: {exc}"}
+
+    async def _synthesize_only(self, params: dict) -> dict:
+        """Sintetiza texto a WAV y devuelve la ruta del archivo. NO reproduce audio.
+        Usado por el endpoint /api/tts para stream al navegador."""
+        raw_text = str(params.get("text", "")).strip()
+        if not raw_text:
+            return {"success": False, "message": "Empty text."}
+
+        clean_text = _clean_text_for_speech(raw_text)
+        if not clean_text:
+            return {"success": False, "message": "No speakable text after cleaning."}
+
+        try:
+            engine = await asyncio.to_thread(self._ensure_kokoro_engine)
+            if not engine:
+                return {"success": False, "message": "Kokoro ONNX engine unavailable."}
+
+            samples, sample_rate = await asyncio.to_thread(
+                engine.create, clean_text, voice=self._voice, speed=1.0, lang="en-us"
+            )
+
+            tmp_dir = Path(tempfile.gettempdir()) / "wis_kokoro"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = tmp_dir / f"sky_{hash(clean_text) & 0xFFFFFFFF}.wav"
+
+            await asyncio.to_thread(sf.write, str(tmp_path), samples, sample_rate)
+            # NO _play_audio — el navegador reproduce el WAV
+
+            return {
+                "success": True,
+                "data": {"wav_path": str(tmp_path), "text": clean_text},
+                "message": f"Synthesized (no playback): '{clean_text[:60]}...'",
+            }
+        except Exception as exc:
+            logger.exception("Error in Kokoro synthesis: %s", exc)
+            return {"success": False, "message": f"Kokoro TTS error: {exc}"}
+
+    def _play_audio(self, audio_path: Path) -> None:
+        """Reproduce el archivo WAV generado por Kokoro directamente a través del dispositivo de audio del sistema."""
+        try:
+            import sounddevice as sd
+            import numpy as np
+            data, samplerate = sf.read(str(audio_path), dtype="float32")
+            sd.play(data, samplerate=samplerate, blocking=True)
+        except Exception as exc:
+            logger.error("sounddevice playback failed, falling back to subprocess: %s", exc)
+            import subprocess, sys
+            path_str = str(audio_path)
+            if sys.platform == "win32":
+                try:
+                    subprocess.Popen(
+                        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path_str],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    ).wait()
+                except (FileNotFoundError, OSError):
+                    import winsound
+                    winsound.PlaySound(path_str, winsound.SND_FILENAME)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["afplay", path_str]).wait()
+            else:
+                subprocess.Popen(["aplay", path_str]).wait()

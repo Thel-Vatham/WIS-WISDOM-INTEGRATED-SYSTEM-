@@ -159,6 +159,28 @@ class Memory:
         self._embedder: _Embedder = embedder or _Embedder()
 
         self._ensure_schema()
+        self._load_recent_history()
+
+    def _load_recent_history(self) -> None:
+        """Carga los últimos SHORT_TERM_LIMIT turnos conversacionales desde la tabla episodic
+        de la base de datos al deque de RAM, evitando la amnesia al reiniciar WIS."""
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    "SELECT user_input, response, created_at FROM episodic ORDER BY id DESC LIMIT ?",
+                    (SHORT_TERM_LIMIT,)
+                )
+                rows = cur.fetchall()
+                for user_input, response, created_at in reversed(rows):
+                    self._short_term.append({
+                        "user": user_input,
+                        "response": response,
+                        "timestamp": created_at
+                    })
+            if rows:
+                logger.info("Short-term memory restored: %d turns loaded from disk.", len(rows))
+        except Exception as exc:
+            logger.warning("Could not load recent history into short-term memory: %s", exc)
 
     def _ensure_schema(self) -> None:
         with self._lock:
@@ -202,6 +224,49 @@ class Memory:
             messages.append({"role": "user", "content": turn.get("user", "")})
             messages.append({"role": "assistant", "content": turn.get("response", "")})
         return messages
+
+    async def compress_history(self, local_client: Any) -> None:
+        """Comprime el historial corto usando el LLM local para ahorrar contexto."""
+        with self._lock:
+            if len(self._short_term) < SHORT_TERM_LIMIT:
+                return
+            
+            # Extrae los turnos mas antiguos (max 6). Limitar la cantidad y la
+            # longitud de cada turno evita que el prompt de compresion exceda
+            # el contexto del modelo local, lo que causaba un abort nativo de
+            # ctransformers que cerraba WIS de golpe.
+            to_compress = []
+            for _ in range(6):
+                if self._short_term:
+                    to_compress.append(self._short_term.popleft())
+                    
+        if not to_compress:
+            return
+            
+        history_text = ""
+        for turn in to_compress:
+            u = (turn.get("user") or "")[:150]
+            r = (turn.get("response") or "")[:250]
+            history_text += f"User: {u}\nAssistant: {r}\n"
+            
+        prompt = (
+            "System: Summarize the following conversation in one short paragraph, focusing on key facts and decisions.\n"
+            f"Conversation:\n{history_text}\nSummary: "
+        )
+        
+        try:
+            summary = await local_client.generate(prompt, max_tokens=80)
+            if summary:
+                from datetime import datetime
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with self._lock:
+                    self._short_term.appendleft({
+                        "user": "[System History Compression]",
+                        "response": summary.strip(),
+                        "timestamp": now_str
+                    })
+        except Exception as e:
+            logger.warning(f"memory: compression failed: {e}")
 
     # --- Facts ---
     def add_fact(
@@ -253,7 +318,10 @@ class Memory:
         user_input = str(user_input or "")
         response = str(response or "")
 
-        self._short_term.append({"user": user_input, "response": response})
+        from datetime import datetime
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        self._short_term.append({"user": user_input, "response": response, "timestamp": now_str})
 
         if not user_input.strip():
             return
@@ -262,8 +330,8 @@ class Memory:
         blob = self._serialize_embedding(vec)
         with self._lock:
             self._conn.execute(
-                "INSERT INTO episodic (user_input, response, embedding) VALUES (?, ?, ?)",
-                (user_input, response, blob),
+                "INSERT INTO episodic (user_input, response, embedding, created_at) VALUES (?, ?, ?, ?)",
+                (user_input, response, blob, now_str),
             )
             self._conn.commit()
 
@@ -278,12 +346,12 @@ class Memory:
         query_vec = self._embedder.embed(query)
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, user_input, response, embedding FROM episodic ORDER BY id DESC LIMIT 100"
+                "SELECT id, user_input, response, embedding, created_at FROM episodic ORDER BY id DESC LIMIT 100"
             ).fetchall()
 
         total_rows = len(rows)
         candidates: List[Tuple[float, Dict[str, Any]]] = []
-        for idx, (row_id, ui, resp, blob) in enumerate(rows):
+        for idx, (row_id, ui, resp, blob, created_at) in enumerate(rows):
             vec = self._deserialize_embedding(blob)
             cosine_sim = _cosine_similarity(query_vec, vec)
             
@@ -302,6 +370,7 @@ class Memory:
                 "id": row_id,
                 "user_input": ui,
                 "response": resp,
+                "created_at": created_at,
                 "score": weighted_score,
                 "similarity": similarity,
             }))

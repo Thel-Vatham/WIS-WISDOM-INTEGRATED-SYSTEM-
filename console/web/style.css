@@ -406,7 +406,78 @@ html, body {
 .action-btn:hover { color: #fff; background: var(--surface-2); }
 .send-btn { color: var(--primary); }
 .send-btn:hover { background: rgba(129, 140, 248, 0.08); }
+.attach-btn { color: var(--text-muted); }
+.attach-btn:hover { color: #fff; }
 .mic-btn.listening { color: var(--error); animation: mic-pulse 1s infinite alternate; }
+
+/* Attachment Preview & Drop Overlay */
+.attachment-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 800px;
+  margin: 0 auto 8px auto;
+  overflow-x: auto;
+  padding: 4px 0;
+}
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  color: #fff;
+}
+.attachment-chip img.thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+.attachment-chip .btn-remove {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-weight: bold;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+}
+.attachment-chip .btn-remove:hover { color: #f87171; }
+
+.drop-overlay {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(12, 14, 18, 0.85);
+  backdrop-filter: blur(8px);
+  z-index: 100;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--primary);
+  border-radius: var(--radius-md);
+  margin: 16px;
+  pointer-events: none;
+}
+.drop-overlay.active,
+.drop-overlay:not([hidden]) {
+  display: flex !important;
+}
+.drop-overlay[hidden] {
+  display: none !important;
+}
+.drop-message {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: var(--primary);
+  font-weight: 600;
+  font-size: 14px;
+}
 
 @keyframes mic-pulse {
   from { opacity: 0.5; transform: scale(0.95); }
@@ -481,6 +552,94 @@ html, body {
   height: 1px;
   background: var(--primary);
 }
+
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  font-size: 9px;
+  font-weight: 600;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+.console-tab.active .tab-badge {
+  background: rgba(129, 140, 248, 0.2);
+  color: var(--primary);
+}
+
+/* Goals Feed & Cards */
+.goals-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.goal-card {
+  background: rgba(18, 20, 26, 0.7);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.goal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.goal-title {
+  font-weight: 600;
+  font-size: 12px;
+  color: #fff;
+}
+.goal-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.goal-status-badge {
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  background: rgba(129, 140, 248, 0.15);
+  color: var(--primary);
+}
+.goal-progress-bar {
+  height: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.goal-progress-fill {
+  height: 100%;
+  background: var(--primary);
+  transition: width 0.3s ease;
+}
+.subtasks-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+.subtask-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+.subtask-row.done { color: #34d399; }
+.subtask-row.executing { color: #60a5fa; font-weight: 600; }
+.subtask-row.failed { color: #f87171; }
 
 .console-controls { display: flex; align-items: center; gap: 6px; }
 .console-icon-btn {
@@ -583,74 +742,126 @@ html, body {
    Nuevos Estilos: Seguridad, Loop Agéntico y Proactividad
    ============================================================ */
 
-/* Overlay de Aprobación */
+/* Overlay de Aprobación (Estilo Antigravity / IDE Moderno) */
 .approval-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(5, 6, 8, 0.85);
-  backdrop-filter: blur(12px);
+  background: rgba(4, 6, 12, 0.75);
+  backdrop-filter: blur(8px);
   z-index: 1000;
   display: flex;
   align-items: center;
   justify-content: center;
   animation: fadeIn 0.2s ease-out;
+  padding: 16px;
 }
 .approval-overlay[hidden] { display: none !important; }
 
 .approval-card {
   width: 100%;
-  max-width: 400px;
-  background: var(--surface);
-  border: 1px solid var(--border-hi);
-  border-radius: var(--radius-lg);
-  padding: 24px;
-  box-shadow: var(--shadow-main);
-  animation: slideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  max-width: 440px;
+  background: #0f172a;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  padding: 18px 20px;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+  animation: slideUp 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.approval-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.approval-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  padding: 3px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.approval-badge--danger {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.3);
 }
 
 .approval-title {
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 600;
-  color: #fff;
-  text-align: center;
-  margin-bottom: 6px;
+  color: #f8fafc;
+  margin: 0;
+  line-height: 1.3;
 }
+
 .approval-desc {
-  font-size: 11.5px;
-  color: var(--text-muted);
-  text-align: center;
-  margin-bottom: 14px;
+  font-size: 12px;
+  color: #94a3b8;
+  margin: 0;
+  line-height: 1.4;
 }
 
 .approval-detail {
   font-family: var(--font-mono);
-  font-size: 10px;
-  background: rgba(0, 0, 0, 0.2);
-  border: 1px solid var(--border);
-  padding: 10px;
-  border-radius: var(--radius-sm);
-  color: #818cf8;
+  font-size: 11px;
+  line-height: 1.45;
+  background: #020617;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: #38bdf8;
   white-space: pre-wrap;
   word-break: break-all;
-  max-height: 120px;
+  max-height: 160px;
   overflow-y: auto;
-  margin-bottom: 18px;
 }
 
-.approval-actions { display: flex; gap: 10px; }
-.approval-btn {
-  flex: 1;
-  border: none;
-  padding: 8px;
-  font-size: 12px;
-  font-weight: 500;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition: opacity 0.15s ease;
+.approval-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
 }
-.approval-btn:hover { opacity: 0.9; }
-.approval-btn--proceed { background: var(--success); color: #fff; }
-.approval-btn--deny { background: var(--error); color: #fff; }
+
+.approval-btn {
+  border: none;
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.approval-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+.approval-btn:active { transform: translateY(0); }
+.approval-btn--proceed {
+  background: #10b981;
+  color: #ffffff;
+  box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
+}
+.approval-btn--deny {
+  background: rgba(255, 255, 255, 0.06);
+  color: #cbd5e1;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+.approval-btn--deny:hover {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.3);
+}
 
 /* Modo de Seguridad (Chip Toggle) */
 .mode-chip {
@@ -772,4 +983,48 @@ html, body {
   0% { box-shadow: 0 0 0 0 rgba(129, 140, 248, 0.3); }
   70% { box-shadow: 0 0 0 5px rgba(129, 140, 248, 0); }
   100% { box-shadow: 0 0 0 0 rgba(129, 140, 248, 0); }
+}
+
+/* Estilos para Tablas Markdown y Separadores */
+.table-container {
+  width: 100%;
+  overflow-x: auto;
+  margin: 10px 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.console-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  text-align: left;
+}
+
+.console-table th {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-bright);
+  font-weight: 600;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.console-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  color: var(--text);
+}
+
+.console-table tr:last-child td {
+  border-bottom: none;
+}
+
+.console-table tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.console-hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
 }
